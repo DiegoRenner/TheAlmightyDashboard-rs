@@ -47,8 +47,18 @@ pub struct Config {
     #[serde(default)]
     pub chia_db_path: Option<String>,
 
+    #[serde(default)]
+    pub starling_token: Option<String>,
+
+    #[serde(default)]
+    pub kraken_api_key: Option<String>,
+
+    #[serde(default)]
+    pub kraken_api_secret: Option<String>,
+
     #[serde(default = "default_update_freq")]
     pub update_frequency_secs: f64,
+
 }
 
 fn default_update_freq() -> f64 {

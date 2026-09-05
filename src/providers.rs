@@ -524,7 +524,188 @@ impl Providers {
     pub async fn fetch_chia_price(&self) -> Option<f64> {
         self.fetch_fx_rate("XCH-USD").await
     }
+
+    /// Fetch Starling Bank account balances
+    pub async fn fetch_starling_balances(&self, token: &str) -> Vec<(String, f64)> {
+        let mut results = Vec::new();
+        if token.is_empty() {
+            return results;
+        }
+
+        let accounts_url = "https://api.starlingbank.com/api/v2/accounts";
+        let resp = match self
+            .client
+            .get(accounts_url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return results,
+        };
+
+        let json: Value = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => return results,
+        };
+
+        let accounts = match json.get("accounts").and_then(|a| a.as_array()) {
+            Some(arr) => arr,
+            None => return results,
+        };
+
+        for acc in accounts {
+            let account_uid = match acc.get("accountUid").and_then(|u| u.as_str()) {
+                Some(uid) => uid,
+                None => continue,
+            };
+
+            let balance_url = format!("https://api.starlingbank.com/api/v2/accounts/{account_uid}/balance");
+            if let Ok(b_resp) = self
+                .client
+                .get(&balance_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                && b_resp.status().is_success()
+                && let Ok(b_json) = b_resp.json::<Value>().await
+            {
+                let minor_units = b_json
+                    .get("effectiveBalance")
+                    .and_then(|eb| eb.get("minorUnits"))
+                    .and_then(|m| m.as_f64())
+                    .or_else(|| {
+                        b_json
+                            .get("totalEffectiveBalance")
+                            .and_then(|eb| eb.get("minorUnits"))
+                            .and_then(|m| m.as_f64())
+                    })
+                    .unwrap_or(0.0);
+
+                let currency = b_json
+                    .get("effectiveBalance")
+                    .and_then(|eb| eb.get("currency"))
+                    .and_then(|c| c.as_str())
+                    .or_else(|| {
+                        acc.get("currency").and_then(|c| c.as_str())
+                    })
+                    .unwrap_or("GBP")
+                    .to_string();
+
+                let balance = minor_units / 100.0;
+                if balance > 0.0 {
+                    results.push((currency, balance));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Fetch Kraken balances via authenticated REST API
+    pub async fn fetch_kraken_balances(&self, api_key: &str, api_secret: &str) -> Vec<(String, f64)> {
+        use base64::prelude::*;
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256, Sha512};
+        use std::time::SystemTime;
+
+        let mut results = Vec::new();
+        if api_key.is_empty() || api_secret.is_empty() {
+            return results;
+        }
+
+        let nonce = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => d.as_millis(),
+            Err(_) => return results,
+        };
+
+        let path = "/0/private/Balance";
+        let post_data = format!("nonce={nonce}");
+
+        // SHA256(nonce + post_data)
+        let mut sha256 = Sha256::new();
+        sha256.update(format!("{nonce}{post_data}").as_bytes());
+        let sha256_digest = sha256.finalize();
+
+        // HMAC-SHA512 of (path + sha256_digest) using base64-decoded api_secret
+        let secret_bytes = match BASE64_STANDARD.decode(api_secret.trim()) {
+            Ok(b) => b,
+            Err(_) => return results,
+        };
+
+        type HmacSha512 = Hmac<Sha512>;
+        let mut mac = match HmacSha512::new_from_slice(&secret_bytes) {
+            Ok(m) => m,
+            Err(_) => return results,
+        };
+
+        mac.update(path.as_bytes());
+        mac.update(&sha256_digest);
+        let api_sign = BASE64_STANDARD.encode(mac.finalize().into_bytes());
+
+        let url = format!("https://api.kraken.com{path}");
+        let resp = match self
+            .client
+            .post(&url)
+            .header("API-Key", api_key.trim())
+            .header("API-Sign", api_sign)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(post_data)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return results,
+        };
+
+        let json: Value = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => return results,
+        };
+
+        if let Some(err_arr) = json.get("error").and_then(|e| e.as_array())
+            && !err_arr.is_empty()
+        {
+            return results;
+        }
+
+        if let Some(res_map) = json.get("result").and_then(|r| r.as_object()) {
+            for (asset, val_val) in res_map {
+                let amt: f64 = val_val
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| val_val.as_f64())
+                    .unwrap_or(0.0);
+
+                if amt > 0.00000001 {
+                    let norm_sym = normalize_kraken_asset(asset);
+                    results.push((norm_sym, amt));
+                }
+            }
+        }
+
+        results
+    }
 }
+
+fn normalize_kraken_asset(asset: &str) -> String {
+    let u = asset.to_uppercase();
+    if u.len() == 4 && (u.starts_with('Z') || u.starts_with('X')) {
+        let base = &u[1..];
+        match base {
+            "XBT" => "BTC".to_string(),
+            "DG" => "DOGE".to_string(),
+            other => other.to_string(),
+        }
+    } else if u == "XXBT" {
+        "BTC".to_string()
+    } else if u == "XDG" {
+        "DOGE".to_string()
+    } else {
+        u
+    }
+}
+
 
 fn find_first_chia_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -646,6 +827,34 @@ mod tests {
             println!("Live Chia wallet balance: {:.8} XCH", amt);
         }
     }
+
+    #[test]
+    fn test_normalize_kraken_asset() {
+        assert_eq!(normalize_kraken_asset("ZCHF"), "CHF");
+        assert_eq!(normalize_kraken_asset("ZUSD"), "USD");
+        assert_eq!(normalize_kraken_asset("ZEUR"), "EUR");
+        assert_eq!(normalize_kraken_asset("ZGBP"), "GBP");
+        assert_eq!(normalize_kraken_asset("XXBT"), "BTC");
+        assert_eq!(normalize_kraken_asset("XETH"), "ETH");
+        assert_eq!(normalize_kraken_asset("XXMR"), "XMR");
+        assert_eq!(normalize_kraken_asset("SOL"), "SOL");
+        assert_eq!(normalize_kraken_asset("USDC"), "USDC");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_starling_empty_token() {
+        let providers = Providers::new();
+        let res = providers.fetch_starling_balances("").await;
+        assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_kraken_empty_credentials() {
+        let providers = Providers::new();
+        let res = providers.fetch_kraken_balances("", "").await;
+        assert!(res.is_empty());
+    }
 }
+
 
 

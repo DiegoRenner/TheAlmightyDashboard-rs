@@ -130,6 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let coinbase_key = config.coinbase_api_key.clone();
         let coinbase_secret = config.coinbase_api_secret.clone();
         let chia_path = config.chia_db_path.clone();
+        let starling_tok = config.starling_token.clone();
+        let kraken_key = config.kraken_api_key.clone();
+        let kraken_secret = config.kraken_api_secret.clone();
 
         tokio::spawn(async move {
             loop {
@@ -235,11 +238,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Check Starling Bank balances (ST)
+                if let Some(ref tok) = starling_tok {
+                    let st_balances = prov.fetch_starling_balances(tok).await;
+                    let fx = {
+                        let state = app.read().await;
+                        state.fx_rates
+                    };
+                    for (curr, amt) in st_balances {
+                        let val_chf = fx.to_chf(&curr, amt);
+                        new_balances.push(BalanceItem {
+                            account: "ST".to_string(),
+                            category: AccountCategory::Cash,
+                            symbol: curr.clone(),
+                            amount: amt,
+                            native_currency: curr,
+                            value_native: amt,
+                            value_chf: val_chf,
+                        });
+                    }
+                }
+
+                // Check Kraken balances
+                if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret) {
+                    let kraken_balances = prov.fetch_kraken_balances(key, secret).await;
+                    for (curr, amt) in kraken_balances {
+                        let (native_curr, val_native, val_chf) = {
+                            let state = app.read().await;
+                            let (nc, vn) = if curr == "USD" {
+                                ("USD".to_string(), amt)
+                            } else if curr == "CHF" {
+                                ("CHF".to_string(), amt)
+                            } else if curr == "EUR" {
+                                ("EUR".to_string(), amt)
+                            } else if curr == "GBP" {
+                                ("GBP".to_string(), amt)
+                            } else {
+                                let price = state.get_crypto_price(&curr).unwrap_or(0.0);
+                                ("USD".to_string(), amt * price)
+                            };
+                            let chf = state.fx_rates.to_chf(&nc, vn);
+                            (nc, vn, chf)
+                        };
+                        new_balances.push(BalanceItem {
+                            account: "Kraken".to_string(),
+                            category: AccountCategory::Crypto,
+                            symbol: curr,
+                            amount: amt,
+                            native_currency: native_curr,
+                            value_native: val_native,
+                            value_chf: val_chf,
+                        });
+                    }
+                }
+
                 {
                     let mut state = app.write().await;
                     state.balances = new_balances;
                     state.update_balance_values();
                 }
+
 
                 tokio::time::sleep(Duration::from_secs_f64(update_secs)).await;
             }

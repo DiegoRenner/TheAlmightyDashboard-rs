@@ -16,4 +16,6 @@ base64 = "0.23.1"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["async-await", "sink", "std"] }
 rusqlite = "0.32"
+hmac = "0.12"
+sha2 = "0.10"
 
