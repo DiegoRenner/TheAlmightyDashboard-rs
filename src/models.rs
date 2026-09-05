@@ -15,7 +15,7 @@ impl TickerItem {
         let initial_sym = target
             .trim_end_matches('/')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("unloaded")
             .to_uppercase();
 
@@ -88,15 +88,38 @@ impl AppState {
     }
 
     pub fn get_crypto_price(&self, symbol: &str) -> Option<f64> {
-        let sym_upper = symbol.to_uppercase();
+        let sym_norm = normalize_crypto_symbol(symbol);
         for t in &self.tickers {
-            if t.symbol.to_uppercase() == sym_upper {
-                if let Some(p) = t.price_num {
+            if normalize_crypto_symbol(&t.symbol) == sym_norm
+                && let Some(p) = t.price_num {
                     return Some(p);
                 }
-            }
         }
         None
+    }
+
+    pub fn update_balance_values(&mut self) {
+        for i in 0..self.balances.len() {
+            let symbol = self.balances[i].symbol.clone();
+            let amount = self.balances[i].amount;
+            let norm = normalize_crypto_symbol(&symbol);
+            if norm == "USD" {
+                self.balances[i].value_usd = amount;
+            } else if let Some(price) = self.get_crypto_price(&symbol) {
+                self.balances[i].value_usd = amount * price;
+            }
+        }
+    }
+}
+
+fn normalize_crypto_symbol(sym: &str) -> String {
+    match sym.to_uppercase().as_str() {
+        "XMR" | "MONERO" => "XMR".to_string(),
+        "BTC" | "BITCOIN" => "BTC".to_string(),
+        "ETH" | "ETHEREUM" => "ETH".to_string(),
+        "BAT" | "BASIC-ATTENTION-TOKEN" => "BAT".to_string(),
+        "USDC" | "USD" => "USD".to_string(),
+        other => other.to_string(),
     }
 }
 
