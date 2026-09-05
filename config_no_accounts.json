@@ -1,0 +1,37 @@
+{
+  "coinmarketcap_urls": [
+    "https://coinmarketcap.com/currencies/monero/",
+    "https://coinmarketcap.com/currencies/basic-attention-token/",
+    "https://coinmarketcap.com/currencies/bitcoin/",
+    "https://coinmarketcap.com/currencies/ethereum/",
+    "https://coinmarketcap.com/currencies/presearch/",
+    "https://coinmarketcap.com/currencies/numeraire/",
+    "https://coinmarketcap.com/currencies/the-graph/",
+    "https://coinmarketcap.com/currencies/nucypher/",
+    "https://coinmarketcap.com/currencies/stellar/",
+    "https://coinmarketcap.com/currencies/compound/",
+    "https://coinmarketcap.com/currencies/skale-network/",
+    "https://coinmarketcap.com/currencies/celo/",
+    "https://coinmarketcap.com/currencies/uma/",
+    "https://coinmarketcap.com/currencies/ampleforth/",
+    "https://coinmarketcap.com/currencies/dogecoin/",
+    "https://coinmarketcap.com/currencies/grin/",
+    "https://coinmarketcap.com/currencies/polygon/",
+    "https://coinmarketcap.com/currencies/picoin/"
+  ],
+  "marketwatch_urls": [
+    "https://www.marketwatch.com/investing/stock/sens",
+    "https://www.marketwatch.com/investing/stock/nsh",
+    "https://www.marketwatch.com/investing/stock/fwaa",
+    "https://www.marketwatch.com/investing/stock/ghvi",
+    "https://www.marketwatch.com/investing/stock/me",
+    "https://www.marketwatch.com/investing/stock/vacq",
+    "https://www.marketwatch.com/investing/stock/svac",
+    "https://www.marketwatch.com/investing/stock/sofi",
+    "https://www.marketwatch.com/investing/stock/atip",
+    "https://www.marketwatch.com/investing/stock/gme",
+    "https://www.marketwatch.com/investing/stock/amc",
+    "https://www.marketwatch.com/investing/stock/bb",
+    "https://www.marketwatch.com/investing/stock/xmrusd"
+  ]
+}
