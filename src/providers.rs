@@ -438,7 +438,107 @@ impl Providers {
 
         results
     }
+
+    /// Fetch live FX rate from Yahoo Finance (e.g. "USDCHF=X")
+    pub async fn fetch_fx_rate(&self, symbol: &str) -> Option<f64> {
+        let hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
+        for host in hosts {
+            let url = format!("https://{host}/v8/finance/chart/{symbol}");
+            if let Ok(resp) = self.client.get(&url).send().await
+                && resp.status().is_success()
+                && let Ok(json) = resp.json::<Value>().await
+                && let Some(results) = json["chart"]["result"].as_array()
+                && let Some(meta) = results.first().and_then(|r| r.get("meta"))
+                && let Some(price_val) = meta.get("regularMarketPrice").and_then(|p| p.as_f64()) {
+                    return Some(price_val);
+                }
+        }
+        None
+    }
+
+    /// Fetch all FX conversion rates to CHF
+    pub async fn fetch_fx_rates(&self) -> crate::models::FxRates {
+        let mut rates = crate::models::FxRates::default();
+        if let Some(r) = self.fetch_fx_rate("USDCHF=X").await {
+            rates.usd_to_chf = r;
+        }
+        if let Some(r) = self.fetch_fx_rate("EURCHF=X").await {
+            rates.eur_to_chf = r;
+        }
+        if let Some(r) = self.fetch_fx_rate("GBPCHF=X").await {
+            rates.gbp_to_chf = r;
+        }
+        rates
+    }
+
+    /// Fetch Chia wallet balance by reading local sqlite DB
+    pub fn fetch_chia_balance(&self, custom_path: Option<&str>) -> Option<f64> {
+        let db_path = if let Some(p) = custom_path {
+            std::path::PathBuf::from(p)
+        } else {
+            let home = std::env::var("HOME").ok()?;
+            let dir = std::path::PathBuf::from(home).join(".chia/mainnet/wallet/db");
+            let fingerprint_file = dir.join("last_used_fingerprint");
+            if let Ok(fp) = std::fs::read_to_string(&fingerprint_file) {
+                let clean_fp = fp.trim();
+                let candidate = dir.join(format!("blockchain_wallet_v2_r1_mainnet_{clean_fp}.sqlite"));
+                if candidate.exists() {
+                    candidate
+                } else {
+                    find_first_chia_db(&dir)?
+                }
+            } else {
+                find_first_chia_db(&dir)?
+            }
+        };
+
+        if !db_path.exists() {
+            return None;
+        }
+
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ).ok()?;
+
+        let mut stmt = conn.prepare("SELECT amount FROM coin_record WHERE spent = 0 AND wallet_id = 1").ok()?;
+        let rows = stmt.query_map([], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        }).ok()?;
+
+        let mut total_mojos: u128 = 0;
+        for row in rows.flatten() {
+            let mut val: u128 = 0;
+            for b in row {
+                val = (val << 8) | (b as u128);
+            }
+            total_mojos += val;
+        }
+
+        let total_xch = (total_mojos as f64) / 1_000_000_000_000.0;
+        Some(total_xch)
+    }
+
+    /// Fetch live Chia (XCH) USD price from Yahoo Finance
+    pub async fn fetch_chia_price(&self) -> Option<f64> {
+        self.fetch_fx_rate("XCH-USD").await
+    }
 }
+
+fn find_first_chia_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("blockchain_wallet_v2_r1_") && name.ends_with(".sqlite") {
+                    return Some(path);
+                }
+        }
+    }
+    None
+}
+
 
 fn extract_next_data(html: &str) -> Option<String> {
     let marker = "id=\"__NEXT_DATA__\"";
@@ -528,5 +628,24 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_fetch_fx_rates_live() {
+        let providers = Providers::new();
+        let rates = providers.fetch_fx_rates().await;
+        assert!(rates.usd_to_chf > 0.5 && rates.usd_to_chf < 1.5);
+        assert!(rates.eur_to_chf > 0.5 && rates.eur_to_chf < 1.5);
+        assert!(rates.gbp_to_chf > 0.5 && rates.gbp_to_chf < 1.8);
+    }
+
+    #[test]
+    fn test_fetch_chia_balance_live() {
+        let providers = Providers::new();
+        if let Some(amt) = providers.fetch_chia_balance(None) {
+            assert!(amt > 0.25);
+            println!("Live Chia wallet balance: {:.8} XCH", amt);
+        }
+    }
 }
+
 

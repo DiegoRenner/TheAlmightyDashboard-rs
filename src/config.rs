@@ -44,6 +44,9 @@ pub struct Config {
     #[serde(default)]
     pub coinbase_api_secret: Option<String>,
 
+    #[serde(default)]
+    pub chia_db_path: Option<String>,
+
     #[serde(default = "default_update_freq")]
     pub update_frequency_secs: f64,
 }

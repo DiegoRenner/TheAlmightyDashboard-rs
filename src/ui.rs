@@ -1,4 +1,4 @@
-use crate::models::AppState;
+use crate::models::{AccountCategory, AppState};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -42,29 +42,36 @@ pub fn render(f: &mut Frame, app: &AppState) {
         Span::styled("[k/↑]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" Up  "),
         Span::styled(
-            format!("(Offset: {})", app.scroll_offset),
+            format!("(Offset: {}) ", app.scroll_offset),
             Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(
+                "| FX: USD/CHF {:.3} · EUR/CHF {:.3} · GBP/CHF {:.3}",
+                app.fx_rates.usd_to_chf, app.fx_rates.eur_to_chf, app.fx_rates.gbp_to_chf
+            ),
+            Style::default().fg(Color::Cyan),
         ),
     ]);
 
     let header_widget = Paragraph::new(help_line).block(header_block);
     f.render_widget(header_widget, chunks[0]);
 
-    // 2. Body: Left = Quotes Table, Right = Balances Table
+    // 2. Body: Left = Quotes Table, Right = Balances Table & Portfolio Summary
     let body_chunks = if chunks[1].width >= 80 {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
             .split(chunks[1])
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[1])
     };
 
     render_tickers_table(f, app, body_chunks[0]);
-    render_balances_table(f, app, body_chunks[1]);
+    render_balances_panel(f, app, body_chunks[1]);
 }
 
 fn render_tickers_table(f: &mut Frame, app: &AppState, area: Rect) {
@@ -109,7 +116,7 @@ fn render_tickers_table(f: &mut Frame, app: &AppState, area: Rect) {
             Constraint::Length(4),
             Constraint::Length(12),
             Constraint::Length(18),
-            Constraint::Min(12),
+            Constraint::Min(10),
         ],
     )
     .header(header)
@@ -122,45 +129,58 @@ fn render_tickers_table(f: &mut Frame, app: &AppState, area: Rect) {
     f.render_widget(table, area);
 }
 
+fn render_balances_panel(f: &mut Frame, app: &AppState, area: Rect) {
+    if area.height < 12 {
+        render_balances_table(f, app, area);
+        return;
+    }
+
+    let sub_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .split(area);
+
+    render_balances_table(f, app, sub_chunks[0]);
+    render_summary_card(f, app, sub_chunks[1]);
+}
+
 fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
-    let header_cells = ["#", "Symbol", "Amount", "Value [$]"]
+    let header_cells = ["#", "Acc", "Cat", "Asset", "Amount", "Val (CHF)"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let mut rows: Vec<Row> = app
+    let rows: Vec<Row> = app
         .balances
         .iter()
         .enumerate()
         .skip(app.scroll_offset)
         .map(|(idx, item)| {
+            let cat_style = match item.category {
+                AccountCategory::Crypto => Style::default().fg(Color::Magenta),
+                AccountCategory::Stocks => Style::default().fg(Color::Blue),
+                AccountCategory::Cash => Style::default().fg(Color::Cyan),
+                AccountCategory::Retirement => Style::default().fg(Color::Green),
+            };
+
             Row::new(vec![
                 Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(item.symbol.clone()).style(Style::default().fg(Color::Yellow)),
+                Cell::from(item.account.clone()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Cell::from(item.category.to_string()).style(cat_style),
+                Cell::from(item.symbol.clone()).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Cell::from(format_balance_amount(item.amount)).style(Style::default().fg(Color::White)),
-                Cell::from(format_balance_value(item.value_usd)).style(Style::default().fg(Color::Green)),
+                Cell::from(format_chf(item.value_chf)).style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ])
         })
         .collect();
 
-    // Total row at the bottom
-    let total_val = app.total_balance_usd();
-    rows.push(
-        Row::new(vec![
-            Cell::from(""),
-            Cell::from("total").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Cell::from(""),
-            Cell::from(format!("{:.2}", total_val))
-                .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
-    );
-
     let table = Table::new(
         rows,
         [
-            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(6),
             Constraint::Length(10),
+            Constraint::Length(8),
             Constraint::Length(14),
             Constraint::Min(12),
         ],
@@ -169,10 +189,67 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Holdings & Balances ", Style::default().add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" Holdings & Accounts ", Style::default().add_modifier(Modifier::BOLD))),
     );
 
     f.render_widget(table, area);
+}
+
+fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
+    let stocks_val = app.stocks_total_chf();
+    let cash_val = app.cash_total_chf();
+    let stocks_cash_val = app.stocks_and_cash_total_chf();
+    let crypto_val = app.crypto_total_chf();
+    let ret_val = app.retirement_total_chf();
+    let total_net_worth = app.total_net_worth_chf();
+    let total_usd = app.total_balance_usd();
+
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::styled(" Stocks & Cash: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("CHF {} ", format_chf(stocks_cash_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("(Stocks: {} / Cash: {})", format_chf(stocks_val), format_chf(cash_val)), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Crypto:        ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("CHF {}", format_chf(crypto_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Retirement:    ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("CHF {}", format_chf(ret_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Total (CHF):   ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("CHF {} ", format_chf(total_net_worth)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("(~${} USD)", format_chf(total_usd)), Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let summary_widget = Paragraph::new(summary_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Span::styled(" Portfolio Ledger Summary ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+    );
+
+    f.render_widget(summary_widget, area);
+}
+
+pub fn format_chf(val: f64) -> String {
+    let int_part = val.trunc().abs() as u64;
+    let frac_part = (val.fract().abs() * 100.0).round() as u64;
+    let sign = if val < -0.001 { "-" } else { "" };
+
+    let s = int_part.to_string();
+    let mut formatted_int = String::new();
+    let len = s.len();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            formatted_int.push('\'');
+        }
+        formatted_int.push(ch);
+    }
+    format!("{}{}.{:02}", sign, formatted_int, frac_part % 100)
 }
 
 fn format_balance_amount(amount: f64) -> String {
@@ -185,12 +262,26 @@ fn format_balance_amount(amount: f64) -> String {
     }
 }
 
-fn format_balance_value(val: f64) -> String {
-    if val == 0.0 {
-        "0.00".to_string()
-    } else if val >= 0.01 {
-        format!("{:.2}", val)
-    } else {
-        format!("{:.4}", val)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_chf() {
+        assert_eq!(format_chf(0.0), "0.00");
+        assert_eq!(format_chf(0.36), "0.36");
+        assert_eq!(format_chf(12.81), "12.81");
+        assert_eq!(format_chf(2370.34), "2'370.34");
+        assert_eq!(format_chf(45655.52), "45'655.52");
+        assert_eq!(format_chf(-1500.25), "-1'500.25");
+    }
+
+    #[test]
+    fn test_format_balance_amount() {
+        assert_eq!(format_balance_amount(0.0), "0.00");
+        assert_eq!(format_balance_amount(7.654321), "7.6543");
+        assert_eq!(format_balance_amount(0.00005432), "0.00005432");
     }
 }
+
+

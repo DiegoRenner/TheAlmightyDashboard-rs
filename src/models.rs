@@ -36,17 +36,70 @@ impl TickerItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountCategory {
+    Crypto,
+    Stocks,
+    Cash,
+    Retirement,
+}
+
+impl std::fmt::Display for AccountCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccountCategory::Crypto => write!(f, "Crypto"),
+            AccountCategory::Stocks => write!(f, "Stocks"),
+            AccountCategory::Cash => write!(f, "Cash"),
+            AccountCategory::Retirement => write!(f, "Retirement"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FxRates {
+    pub usd_to_chf: f64,
+    pub eur_to_chf: f64,
+    pub gbp_to_chf: f64,
+}
+
+impl Default for FxRates {
+    fn default() -> Self {
+        Self {
+            usd_to_chf: 0.81,
+            eur_to_chf: 0.94,
+            gbp_to_chf: 1.09,
+        }
+    }
+}
+
+impl FxRates {
+    pub fn to_chf(self, currency: &str, amount: f64) -> f64 {
+        match currency.to_uppercase().as_str() {
+            "CHF" => amount,
+            "USD" => amount * self.usd_to_chf,
+            "EUR" => amount * self.eur_to_chf,
+            "GBP" => amount * self.gbp_to_chf,
+            _ => amount * self.usd_to_chf,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BalanceItem {
+    pub account: String,
+    pub category: AccountCategory,
     pub symbol: String,
     pub amount: f64,
-    pub value_usd: f64,
+    pub native_currency: String,
+    pub value_native: f64,
+    pub value_chf: f64,
 }
 
 #[derive(Debug)]
 pub struct AppState {
     pub tickers: Vec<TickerItem>,
     pub balances: Vec<BalanceItem>,
+    pub fx_rates: FxRates,
     pub scroll_offset: usize,
     pub should_quit: bool,
 }
@@ -65,13 +118,58 @@ impl AppState {
         Self {
             tickers,
             balances: Vec::new(),
+            fx_rates: FxRates::default(),
             scroll_offset: 0,
             should_quit: false,
         }
     }
 
     pub fn total_balance_usd(&self) -> f64 {
-        self.balances.iter().map(|b| b.value_usd).sum()
+        if self.fx_rates.usd_to_chf > 0.0 {
+            self.total_net_worth_chf() / self.fx_rates.usd_to_chf
+        } else {
+            0.0
+        }
+    }
+
+    pub fn crypto_total_chf(&self) -> f64 {
+        self.balances
+            .iter()
+            .filter(|b| b.category == AccountCategory::Crypto)
+            .map(|b| b.value_chf)
+            .sum()
+    }
+
+    pub fn stocks_total_chf(&self) -> f64 {
+        self.balances
+            .iter()
+            .filter(|b| b.category == AccountCategory::Stocks)
+            .map(|b| b.value_chf)
+            .sum()
+    }
+
+    pub fn cash_total_chf(&self) -> f64 {
+        self.balances
+            .iter()
+            .filter(|b| b.category == AccountCategory::Cash)
+            .map(|b| b.value_chf)
+            .sum()
+    }
+
+    pub fn stocks_and_cash_total_chf(&self) -> f64 {
+        self.stocks_total_chf() + self.cash_total_chf()
+    }
+
+    pub fn retirement_total_chf(&self) -> f64 {
+        self.balances
+            .iter()
+            .filter(|b| b.category == AccountCategory::Retirement)
+            .map(|b| b.value_chf)
+            .sum()
+    }
+
+    pub fn total_net_worth_chf(&self) -> f64 {
+        self.balances.iter().map(|b| b.value_chf).sum()
     }
 
     pub fn scroll_down(&mut self) {
@@ -99,17 +197,33 @@ impl AppState {
     }
 
     pub fn update_balance_values(&mut self) {
+        let fx = self.fx_rates;
         for i in 0..self.balances.len() {
             let symbol = self.balances[i].symbol.clone();
             let amount = self.balances[i].amount;
             let norm = normalize_crypto_symbol(&symbol);
             if norm == "USD" {
-                self.balances[i].value_usd = amount;
+                self.balances[i].value_native = amount;
+                self.balances[i].native_currency = "USD".to_string();
+            } else if norm == "EUR" {
+                self.balances[i].value_native = amount;
+                self.balances[i].native_currency = "EUR".to_string();
+            } else if norm == "GBP" {
+                self.balances[i].value_native = amount;
+                self.balances[i].native_currency = "GBP".to_string();
+            } else if norm == "CHF" {
+                self.balances[i].value_native = amount;
+                self.balances[i].native_currency = "CHF".to_string();
             } else if let Some(price) = self.get_crypto_price(&symbol) {
-                self.balances[i].value_usd = amount * price;
+                self.balances[i].value_native = amount * price;
+                self.balances[i].native_currency = "USD".to_string();
             }
+            let native_curr = self.balances[i].native_currency.clone();
+            let val_nat = self.balances[i].value_native;
+            self.balances[i].value_chf = fx.to_chf(&native_curr, val_nat);
         }
     }
+
 }
 
 fn normalize_crypto_symbol(sym: &str) -> String {
@@ -118,6 +232,7 @@ fn normalize_crypto_symbol(sym: &str) -> String {
         "BTC" | "BITCOIN" => "BTC".to_string(),
         "ETH" | "ETHEREUM" => "ETH".to_string(),
         "BAT" | "BASIC-ATTENTION-TOKEN" => "BAT".to_string(),
+        "XCH" | "CHIA" | "CHIA-NETWORK" => "XCH".to_string(),
         "USDC" | "USD" => "USD".to_string(),
         other => other.to_string(),
     }
@@ -150,17 +265,43 @@ mod tests {
     #[test]
     fn test_balance_calculation() {
         let mut state = AppState::new(vec![], vec![]);
+        state.fx_rates = FxRates {
+            usd_to_chf: 0.80,
+            eur_to_chf: 0.90,
+            gbp_to_chf: 1.10,
+        };
         state.balances.push(BalanceItem {
+            account: "CB".to_string(),
+            category: AccountCategory::Crypto,
             symbol: "USD".to_string(),
             amount: 100.0,
-            value_usd: 100.0,
+            native_currency: "USD".to_string(),
+            value_native: 100.0,
+            value_chf: 80.0,
         });
         state.balances.push(BalanceItem {
+            account: "MW".to_string(),
+            category: AccountCategory::Crypto,
             symbol: "BTC".to_string(),
             amount: 0.5,
-            value_usd: 35000.0,
+            native_currency: "USD".to_string(),
+            value_native: 35000.0,
+            value_chf: 28000.0,
+        });
+        state.balances.push(BalanceItem {
+            account: "ST".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "GBP".to_string(),
+            amount: 1000.0,
+            native_currency: "GBP".to_string(),
+            value_native: 1000.0,
+            value_chf: 1100.0,
         });
 
-        assert_eq!(state.total_balance_usd(), 35100.0);
+        assert_eq!(state.crypto_total_chf(), 28080.0);
+        assert_eq!(state.cash_total_chf(), 1100.0);
+        assert_eq!(state.stocks_and_cash_total_chf(), 1100.0);
+        assert_eq!(state.total_net_worth_chf(), 29180.0);
     }
 }
+

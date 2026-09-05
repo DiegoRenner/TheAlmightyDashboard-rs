@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use models::{AppState, BalanceItem};
+use models::{AccountCategory, AppState, BalanceItem};
 use providers::Providers;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -104,7 +104,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 3. Background worker: Accounts & Balances
+    // 3. Background worker: Live FX Rates
+    {
+        let app = Arc::clone(&app_state);
+        let prov = Arc::clone(&providers);
+        tokio::spawn(async move {
+            loop {
+                let rates = prov.fetch_fx_rates().await;
+                {
+                    let mut state = app.write().await;
+                    state.fx_rates = rates;
+                    state.update_balance_values();
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // 4. Background worker: Accounts & Balances
     {
         let app = Arc::clone(&app_state);
         let prov = Arc::clone(&providers);
@@ -112,54 +129,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let uphold_tok = config.uphold_token.clone();
         let coinbase_key = config.coinbase_api_key.clone();
         let coinbase_secret = config.coinbase_api_secret.clone();
+        let chia_path = config.chia_db_path.clone();
 
         tokio::spawn(async move {
             loop {
                 let mut new_balances = Vec::new();
 
-                // Check Monero balances
+                // Check Monero balances (MW)
                 for addr in &monero_addrs {
                     if let Some(amt) = prov.fetch_monero_balance(addr).await
                         && amt > 0.0 {
-                            let xmr_price = {
+                            let (xmr_price, fx) = {
                                 let state = app.read().await;
-                                state.get_crypto_price("XMR").unwrap_or(0.0)
+                                (state.get_crypto_price("XMR").unwrap_or(0.0), state.fx_rates)
                             };
+                            let val_usd = amt * xmr_price;
+                            let val_chf = fx.to_chf("USD", val_usd);
                             new_balances.push(BalanceItem {
+                                account: "MW".to_string(),
+                                category: AccountCategory::Crypto,
                                 symbol: "XMR".to_string(),
                                 amount: amt,
-                                value_usd: amt * xmr_price,
+                                native_currency: "USD".to_string(),
+                                value_native: val_usd,
+                                value_chf: val_chf,
                             });
                         }
                 }
 
-                // Check Uphold balances
+                // Check Chia balance (CW)
+                if let Some(amt) = prov.fetch_chia_balance(chia_path.as_deref())
+                    && amt > 0.0 {
+                        let (cached_price, fx) = {
+                            let state = app.read().await;
+                            (state.get_crypto_price("XCH"), state.fx_rates)
+                        };
+                        let xch_price = match cached_price {
+                            Some(p) => p,
+                            None => prov.fetch_chia_price().await.unwrap_or(1.42),
+                        };
+                        let val_usd = amt * xch_price;
+                        let val_chf = fx.to_chf("USD", val_usd);
+                        new_balances.push(BalanceItem {
+                            account: "CW".to_string(),
+                            category: AccountCategory::Crypto,
+                            symbol: "XCH".to_string(),
+                            amount: amt,
+                            native_currency: "USD".to_string(),
+                            value_native: val_usd,
+                            value_chf: val_chf,
+                        });
+                    }
+
+                // Check Uphold balances (UH)
                 if let Some(ref tok) = uphold_tok {
                     let cards = prov.fetch_uphold_cards(tok).await;
-                    let state = app.read().await;
                     for (curr, amt) in cards {
-                        let val = if curr == "USD" {
-                            amt
-                        } else {
-                            let price = state.get_crypto_price(&curr).unwrap_or(0.0);
-                            amt * price
+                        let (native_curr, val_native, val_chf) = {
+                            let state = app.read().await;
+                            let (native_c, val_n) = if curr == "USD" {
+                                ("USD".to_string(), amt)
+                            } else if curr == "EUR" {
+                                ("EUR".to_string(), amt)
+                            } else if curr == "GBP" {
+                                ("GBP".to_string(), amt)
+                            } else if curr == "CHF" {
+                                ("CHF".to_string(), amt)
+                            } else {
+                                let price = state.get_crypto_price(&curr).unwrap_or(0.0);
+                                ("USD".to_string(), amt * price)
+                            };
+                            let chf = state.fx_rates.to_chf(&native_c, val_n);
+                            (native_c, val_n, chf)
                         };
                         new_balances.push(BalanceItem {
+                            account: "UH".to_string(),
+                            category: AccountCategory::Crypto,
                             symbol: curr,
                             amount: amt,
-                            value_usd: val,
+                            native_currency: native_curr,
+                            value_native: val_native,
+                            value_chf: val_chf,
                         });
                     }
                 }
 
-                // Check Coinbase balances
+                // Check Coinbase balances (CB)
                 if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret) {
                     let cb_balances = prov.fetch_coinbase_balances(key, secret).await;
-                    for (curr, amt, val) in cb_balances {
+                    let fx = {
+                        let state = app.read().await;
+                        state.fx_rates
+                    };
+                    for (curr, amt, val_usd) in cb_balances {
+                        let val_chf = fx.to_chf("USD", val_usd);
                         new_balances.push(BalanceItem {
+                            account: "CB".to_string(),
+                            category: AccountCategory::Crypto,
                             symbol: curr,
                             amount: amt,
-                            value_usd: val,
+                            native_currency: "USD".to_string(),
+                            value_native: val_usd,
+                            value_chf: val_chf,
                         });
                     }
                 }
@@ -174,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
 
     // 4. Main UI and Event loop
     let tick_rate = Duration::from_millis(100);
