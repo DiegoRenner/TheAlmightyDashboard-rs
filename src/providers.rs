@@ -760,19 +760,22 @@ impl Providers {
             return false;
         }
         let clean_token = token.trim().trim_start_matches("Bearer ").trim();
-        match self
-            .client
-            .get("https://3a.finpension.ch/api/portfolios")
-            .header("Authorization", format!("Bearer {clean_token}"))
-            .header("x-app-platform", "web")
-            .header("Accept", "application/json")
-            .timeout(Duration::from_secs(4))
-            .send()
-            .await
-        {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+        for url in &["https://3a.finpension.ch/api/portfolios", "https://vb.finpension.ch/api/portfolios"] {
+            if let Ok(resp) = self
+                .client
+                .get(*url)
+                .header("Authorization", format!("Bearer {clean_token}"))
+                .header("x-app-platform", "web")
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(4))
+                .send()
+                .await
+                && resp.status().is_success()
+            {
+                return true;
+            }
         }
+        false
     }
 
     /// Extract fresh Finpension Bearer token from an active browser tab via Chrome DevTools Protocol (CDP)
@@ -816,9 +819,17 @@ impl Providers {
             let rt_enable = serde_json::json!({ "id": 2, "method": "Runtime.enable" }).to_string();
             let _ = ws_stream.send(Message::Text(rt_enable.into())).await;
 
-            // Check storage for access_token or JWT
+            // Check storage (including Redux Persist root) for access_token or JWT
             let check_storage_js = r#"
             (() => {
+                try {
+                    const rootStr = sessionStorage.getItem("persist:root") || localStorage.getItem("persist:root");
+                    if (rootStr) {
+                        const root = JSON.parse(rootStr);
+                        const auth = typeof root.auth === "string" ? JSON.parse(root.auth) : root.auth;
+                        if (auth && auth.token) return auth.token;
+                    }
+                } catch(e) {}
                 for (let [k, v] of Object.entries(localStorage).concat(Object.entries(sessionStorage))) {
                     if (typeof v === 'string') {
                         if (v.startsWith('ey') && v.length > 40 && v.includes('.')) return v;
@@ -847,7 +858,7 @@ impl Providers {
                 "id": 4,
                 "method": "Runtime.evaluate",
                 "params": {
-                    "expression": "try { fetch('https://3a.finpension.ch/api/portfolios', { headers: { 'x-app-platform': 'web', 'Accept': 'application/json' } }); } catch(e) {}"
+                    "expression": "try { fetch('https://3a.finpension.ch/api/portfolios', { headers: { 'x-app-platform': 'web', 'Accept': 'application/json' } }); fetch('https://vb.finpension.ch/api/portfolios', { headers: { 'x-app-platform': 'web', 'Accept': 'application/json' } }); } catch(e) {}"
                 }
             }).to_string();
             let _ = ws_stream.send(Message::Text(trigger_fetch.into())).await;
@@ -888,7 +899,7 @@ impl Providers {
         }
     }
 
-    /// Fetch Finpension 3a portfolios (Retirement category).
+    /// Fetch Finpension portfolios (3a, Vested Benefits / Freizügigkeit, Invest).
     /// If token is None or expired, attempts automatic CDP extraction from Brave browser.
     /// Returns (portfolios, Option<newly_extracted_token>)
     pub async fn fetch_finpension_portfolios(&self, token_opt: Option<&str>) -> Option<(Vec<(String, f64)>, Option<String>)> {
@@ -914,25 +925,43 @@ impl Providers {
         }
 
         let clean_token = token.trim().trim_start_matches("Bearer ").trim();
-        let url = "https://3a.finpension.ch/api/portfolios";
+        let endpoints = [
+            "https://3a.finpension.ch/api/portfolios",
+            "https://vb.finpension.ch/api/portfolios",
+            "https://invest.finpension.ch/api/portfolios",
+        ];
 
-        let resp = self
-            .client
-            .get(url)
-            .header("Authorization", format!("Bearer {clean_token}"))
-            .header("x-app-platform", "web")
-            .header("Accept", "application/json")
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await
-            .ok()?;
+        let mut all_portfolios = Vec::new();
+        let mut any_success = false;
 
-        if !resp.status().is_success() {
-            return None;
+        for url in endpoints {
+            let resp = self
+                .client
+                .get(url)
+                .header("Authorization", format!("Bearer {clean_token}"))
+                .header("x-app-platform", "web")
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+
+            if let Ok(r) = resp
+                && r.status().is_success()
+            {
+                any_success = true;
+                if let Ok(json) = r.json::<Value>().await
+                    && let Some(items) = parse_finpension_portfolios_json(&json)
+                {
+                    all_portfolios.extend(items);
+                }
+            }
         }
 
-        let json = resp.json::<Value>().await.ok()?;
-        parse_finpension_portfolios_json(&json)
+        if any_success && !all_portfolios.is_empty() {
+            Some(all_portfolios)
+        } else {
+            None
+        }
     }
 }
 
@@ -946,6 +975,8 @@ pub fn parse_finpension_portfolios_json(val: &Value) -> Option<Vec<(String, f64)
         let name = item
             .get("name")
             .and_then(|n| n.as_str())
+            .or_else(|| item.pointer("/strategy/name_en").and_then(|n| n.as_str()))
+            .or_else(|| item.pointer("/strategy/name_de").and_then(|n| n.as_str()))
             .or_else(|| item.pointer("/strategy/name").and_then(|n| n.as_str()))
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("Portfolio {}", i + 1));
