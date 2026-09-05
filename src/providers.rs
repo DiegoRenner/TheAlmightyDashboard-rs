@@ -235,8 +235,14 @@ impl Providers {
 
     /// Extract fresh Uphold Bearer token from a running Brave instance via Chrome DevTools Protocol (CDP)
     pub async fn try_extract_uphold_token_from_cdp(&self) -> Option<String> {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
+        #[cfg(test)]
+        {
+            return None;
+        }
+        #[cfg(not(test))]
+        {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
 
         let targets_resp = self
             .client
@@ -353,6 +359,7 @@ impl Providers {
         }
 
         None
+        }
     }
 
 
@@ -748,8 +755,160 @@ impl Providers {
         None
     }
 
-    /// Fetch Finpension 3a portfolios (Retirement category)
-    pub async fn fetch_finpension_portfolios(&self, token: &str) -> Option<Vec<(String, f64)>> {
+    pub async fn validate_finpension_token(&self, token: &str) -> bool {
+        if token.trim().is_empty() {
+            return false;
+        }
+        let clean_token = token.trim().trim_start_matches("Bearer ").trim();
+        match self
+            .client
+            .get("https://3a.finpension.ch/api/portfolios")
+            .header("Authorization", format!("Bearer {clean_token}"))
+            .header("x-app-platform", "web")
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Extract fresh Finpension Bearer token from an active browser tab via Chrome DevTools Protocol (CDP)
+    pub async fn try_extract_finpension_token_from_cdp(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            return None;
+        }
+        #[cfg(not(test))]
+        {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+
+            let targets_resp = self
+                .client
+                .get("http://127.0.0.1:9222/json")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .ok()?;
+            let targets: Value = targets_resp.json().await.ok()?;
+            let targets_arr = targets.as_array()?;
+
+            let mut ws_url = None;
+            for t in targets_arr {
+                let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                let ty = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
+                if url.contains("finpension.ch") && ty == "page"
+                    && let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
+                        ws_url = Some(ws.to_string());
+                        break;
+                    }
+            }
+
+            let ws_url = ws_url?;
+            let (mut ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
+
+            let net_enable = serde_json::json!({ "id": 1, "method": "Network.enable" }).to_string();
+            let _ = ws_stream.send(Message::Text(net_enable.into())).await;
+
+            let rt_enable = serde_json::json!({ "id": 2, "method": "Runtime.enable" }).to_string();
+            let _ = ws_stream.send(Message::Text(rt_enable.into())).await;
+
+            // Check storage for access_token or JWT
+            let check_storage_js = r#"
+            (() => {
+                for (let [k, v] of Object.entries(localStorage).concat(Object.entries(sessionStorage))) {
+                    if (typeof v === 'string') {
+                        if (v.startsWith('ey') && v.length > 40 && v.includes('.')) return v;
+                        try {
+                            const p = JSON.parse(v);
+                            const t = p?.access_token || p?.accessToken || p?.token || p?.jwt || p?.idToken || p?.state?.token;
+                            if (t && typeof t === 'string' && t.length > 20) return t;
+                        } catch(e) {}
+                    }
+                }
+                return null;
+            })()
+            "#;
+            let eval_storage = serde_json::json!({
+                "id": 3,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": check_storage_js,
+                    "returnByValue": true
+                }
+            }).to_string();
+            let _ = ws_stream.send(Message::Text(eval_storage.into())).await;
+
+            // Trigger fetch from page context so native auth/interceptor headers attach
+            let trigger_fetch = serde_json::json!({
+                "id": 4,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": "try { fetch('https://3a.finpension.ch/api/portfolios', { headers: { 'x-app-platform': 'web', 'Accept': 'application/json' } }); } catch(e) {}"
+                }
+            }).to_string();
+            let _ = ws_stream.send(Message::Text(trigger_fetch.into())).await;
+
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                let msg = match tokio::time::timeout(Duration::from_millis(1500), ws_stream.next()).await {
+                    Ok(Some(Ok(Message::Text(txt)))) => txt,
+                    _ => break,
+                };
+
+                if let Ok(val) = serde_json::from_str::<Value>(&msg) {
+                    // Storage evaluation response
+                    if val.get("id") == Some(&serde_json::json!(3))
+                        && let Some(tok) = val.pointer("/result/result/value").and_then(|v| v.as_str())
+                            && self.validate_finpension_token(tok).await {
+                                return Some(tok.to_string());
+                            }
+
+                    // Network request intercept
+                    if val.get("method") == Some(&serde_json::json!("Network.requestWillBeSent"))
+                        && let Some(headers) = val.pointer("/params/request/headers").and_then(|h| h.as_object()) {
+                            for (k, v) in headers {
+                                if k.eq_ignore_ascii_case("authorization")
+                                    && let Some(auth_val) = v.as_str()
+                                        && auth_val.starts_with("Bearer ") {
+                                            let candidate = auth_val.trim_start_matches("Bearer ").trim();
+                                            if self.validate_finpension_token(candidate).await {
+                                                return Some(candidate.to_string());
+                                            }
+                                        }
+                            }
+                        }
+                }
+            }
+
+            None
+        }
+    }
+
+    /// Fetch Finpension 3a portfolios (Retirement category).
+    /// If token is None or expired, attempts automatic CDP extraction from Brave browser.
+    /// Returns (portfolios, Option<newly_extracted_token>)
+    pub async fn fetch_finpension_portfolios(&self, token_opt: Option<&str>) -> Option<(Vec<(String, f64)>, Option<String>)> {
+        if let Some(token) = token_opt
+            && !token.trim().is_empty()
+            && let Some(portfolios) = self.do_fetch_finpension_portfolios(token).await {
+                return Some((portfolios, None));
+            }
+
+        // Token missing or expired -> attempt silent CDP extraction from Brave tab
+        if let Some(new_token) = self.try_extract_finpension_token_from_cdp().await
+            && let Some(portfolios) = self.do_fetch_finpension_portfolios(&new_token).await {
+                save_finpension_token_to_config(&new_token);
+                return Some((portfolios, Some(new_token)));
+            }
+
+        None
+    }
+
+    async fn do_fetch_finpension_portfolios(&self, token: &str) -> Option<Vec<(String, f64)>> {
         if token.trim().is_empty() {
             return None;
         }
@@ -1030,16 +1189,46 @@ fn format_price(price: f64) -> String {
 }
 
 fn save_uphold_token_to_config(token: &str) {
-    for path in &["config.json", "/home/diego/code/dashboard/config.json"] {
-        if let Ok(content) = std::fs::read_to_string(path)
-            && let Ok(mut val) = serde_json::from_str::<Value>(&content) {
-                val["uphold_token"] = serde_json::json!(token);
-                let tmp_path = format!("{path}.tmp");
-                if let Ok(serialized) = serde_json::to_string_pretty(&val)
-                    && std::fs::write(&tmp_path, serialized).is_ok() {
-                        let _ = std::fs::rename(tmp_path, path);
-                    }
-            }
+    #[cfg(test)]
+    {
+        let _ = token;
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        for path in &["config.json", "/home/diego/code/dashboard/config.json"] {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(mut val) = serde_json::from_str::<Value>(&content) {
+                    val["uphold_token"] = serde_json::json!(token);
+                    let tmp_path = format!("{path}.tmp");
+                    if let Ok(serialized) = serde_json::to_string_pretty(&val)
+                        && std::fs::write(&tmp_path, serialized).is_ok() {
+                            let _ = std::fs::rename(tmp_path, path);
+                        }
+                }
+        }
+    }
+}
+
+fn save_finpension_token_to_config(token: &str) {
+    #[cfg(test)]
+    {
+        let _ = token;
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        for path in &["config.json", "/home/diego/code/dashboard/config.json"] {
+            if let Ok(content) = std::fs::read_to_string(path)
+                && let Ok(mut val) = serde_json::from_str::<Value>(&content) {
+                    val["finpension_token"] = serde_json::json!(token);
+                    let tmp_path = format!("{path}.tmp");
+                    if let Ok(serialized) = serde_json::to_string_pretty(&val)
+                        && std::fs::write(&tmp_path, serialized).is_ok() {
+                            let _ = std::fs::rename(tmp_path, path);
+                        }
+                }
+        }
     }
 }
 
@@ -1285,8 +1474,17 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_finpension_empty_token() {
         let providers = Providers::new();
-        let res = providers.fetch_finpension_portfolios("").await;
+        let res = providers.fetch_finpension_portfolios(Some("")).await;
         assert!(res.is_none());
+        let res_none = providers.fetch_finpension_portfolios(None).await;
+        assert!(res_none.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_validate_tokens_empty() {
+        let providers = Providers::new();
+        assert!(!providers.validate_uphold_token("").await);
+        assert!(!providers.validate_finpension_token("").await);
     }
 
     #[tokio::test]
