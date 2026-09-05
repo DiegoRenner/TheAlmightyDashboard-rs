@@ -137,10 +137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let starling_tok = config.starling_token.clone();
         let kraken_key = config.kraken_api_key.clone();
         let kraken_secret = config.kraken_api_secret.clone();
+        let ibkr_tok = config.ibkr_flex_token.clone();
+        let ibkr_qid = config.ibkr_query_id.clone();
 
         tokio::spawn(async move {
             let mut last_starling_poll: Option<Instant> = None;
             let mut starling_poll_interval = Duration::from_secs(60);
+            let mut last_ibkr_poll: Option<Instant> = None;
+            let mut ibkr_poll_interval = Duration::from_secs(600);
 
             loop {
                 // Check Monero balances (MW)
@@ -395,6 +399,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut state = app.write().await;
                         state.update_account_balances("Kraken", kraken_items);
                     }
+
+                // Check Interactive Brokers balances (IB)
+                if let (Some(tok), Some(qid)) = (&ibkr_tok, &ibkr_qid) {
+                    let should_poll = !matches!(last_ibkr_poll, Some(t) if t.elapsed() < ibkr_poll_interval);
+                    if should_poll {
+                        last_ibkr_poll = Some(Instant::now());
+                        if let Some(holdings) = prov.fetch_ibkr_holdings(tok, qid).await {
+                            ibkr_poll_interval = Duration::from_secs(600);
+                            let fx = {
+                                let state = app.read().await;
+                                state.fx_rates
+                            };
+                            let mut ib_items = Vec::new();
+                            for h in holdings {
+                                let val_chf = fx.to_chf(&h.currency, h.value_native);
+                                ib_items.push(BalanceItem {
+                                    account: "IB".to_string(),
+                                    category: h.category,
+                                    symbol: h.symbol,
+                                    amount: h.amount,
+                                    native_currency: h.currency,
+                                    value_native: h.value_native,
+                                    value_chf: val_chf,
+                                });
+                            }
+                            let mut state = app.write().await;
+                            state.update_account_balances("IB", ib_items);
+                        } else {
+                            // Backoff on rate limit or error
+                            ibkr_poll_interval = Duration::from_secs(120);
+                        }
+                    }
+                }
 
                 {
                     let mut state = app.write().await;

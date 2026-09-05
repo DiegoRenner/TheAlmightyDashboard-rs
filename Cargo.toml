@@ -18,4 +18,5 @@ futures-util = { version = "0.3.34", default-features = false, features = ["asyn
 rusqlite = "0.32"
 hmac = "0.12"
 sha2 = "0.10"
+quick-xml = "0.42.0"
 

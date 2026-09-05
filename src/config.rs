@@ -56,6 +56,12 @@ pub struct Config {
     #[serde(default)]
     pub kraken_api_secret: Option<String>,
 
+    #[serde(default)]
+    pub ibkr_flex_token: Option<String>,
+
+    #[serde(default)]
+    pub ibkr_query_id: Option<String>,
+
     #[serde(default = "default_update_freq")]
     pub update_frequency_secs: f64,
 

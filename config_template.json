@@ -3,6 +3,11 @@
   "uphold_token": "<uphold_token>",
   "coinbase_api_key": "<coinbase_api_key>",
   "coinbase_api_secret": "<coinbase_api_secret>",
+  "starling_token": "<starling_token>",
+  "kraken_api_key": "<kraken_api_key>",
+  "kraken_api_secret": "<kraken_api_secret>",
+  "ibkr_flex_token": "<ibkr_flex_token>",
+  "ibkr_query_id": "<ibkr_query_id>",
   "coinmarketcap_urls": [
     "https://coinmarketcap.com/currencies/monero/",
     "https://coinmarketcap.com/currencies/basic-attention-token/",

@@ -704,6 +704,186 @@ impl Providers {
 
         Some(results)
     }
+
+    /// Fetch Interactive Brokers portfolio holdings (Cash and Stocks) via Flex Web Service
+    pub async fn fetch_ibkr_holdings(&self, token: &str, query_id: &str) -> Option<Vec<IbkrHolding>> {
+        if token.trim().is_empty() || query_id.trim().is_empty() {
+            return None;
+        }
+
+        let send_url = format!(
+            "https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest?t={}&q={}&v=3",
+            token.trim(),
+            query_id.trim()
+        );
+
+        let send_resp = self.client.get(&send_url).timeout(Duration::from_secs(15)).send().await.ok()?;
+        if !send_resp.status().is_success() {
+            return None;
+        }
+        let send_xml = send_resp.text().await.ok()?;
+        let ref_code = parse_ibkr_send_request_xml(&send_xml).ok()?;
+
+        let get_url = format!(
+            "https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement?q={}&t={}&v=3",
+            ref_code.trim(),
+            token.trim()
+        );
+
+        // IBKR statement generation can take a moment, retry if code 1019
+        for _ in 0..4 {
+            let stmt_resp = self.client.get(&get_url).timeout(Duration::from_secs(20)).send().await.ok()?;
+            if stmt_resp.status().is_success() {
+                let stmt_xml = stmt_resp.text().await.ok()?;
+                if stmt_xml.contains("<ErrorCode>1019</ErrorCode>") {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    continue;
+                }
+                let holdings = parse_ibkr_statement_xml(&stmt_xml);
+                return Some(holdings);
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IbkrHolding {
+    pub category: crate::models::AccountCategory,
+    pub symbol: String,
+    pub amount: f64,
+    pub currency: String,
+    pub value_native: f64,
+}
+
+pub fn parse_ibkr_send_request_xml(xml: &str) -> Result<String, String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut status = String::new();
+    let mut ref_code = String::new();
+    let mut err_msg = String::new();
+    let mut current_tag = String::new();
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                current_tag = e.name().as_ref().to_string();
+            }
+            Ok(Event::Text(ref e)) => {
+                let txt = e.as_ref().trim().to_string();
+                match current_tag.as_str() {
+                    "Status" => status = txt,
+                    "ReferenceCode" => ref_code = txt,
+                    "ErrorMessage" => err_msg = txt,
+                    _ => {}
+                }
+            }
+            Ok(Event::End(_)) => {
+                current_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML parse error: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if status.eq_ignore_ascii_case("Success") && !ref_code.is_empty() {
+        Ok(ref_code)
+    } else if !err_msg.is_empty() {
+        Err(err_msg)
+    } else if !status.is_empty() {
+        Err(format!("IBKR response status: {status}"))
+    } else {
+        Err("Invalid IBKR XML response".to_string())
+    }
+}
+
+pub fn parse_ibkr_statement_xml(xml: &str) -> Vec<IbkrHolding> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut holdings = Vec::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                let tag = name.as_ref();
+                if tag == "OpenPosition" {
+                    let mut symbol = String::new();
+                    let mut position: f64 = 0.0;
+                    let mut mark_price: f64 = 0.0;
+                    let mut currency = "USD".to_string();
+                    let mut position_value: Option<f64> = None;
+
+                    for attr in e.attributes().flatten() {
+                        let key = attr.key.as_ref();
+                        let val = attr.value.as_ref().to_string();
+                        match key {
+                            "symbol" => symbol = val,
+                            "position" => position = val.parse().unwrap_or(0.0),
+                            "markPrice" => mark_price = val.parse().unwrap_or(0.0),
+                            "currency" => currency = val.to_uppercase(),
+                            "positionValue" => position_value = val.parse().ok(),
+                            _ => {}
+                        }
+                    }
+
+                    if !symbol.is_empty() && position.abs() > 0.000001 {
+                        let val_native = position_value.unwrap_or(position * mark_price);
+                        holdings.push(IbkrHolding {
+                            category: crate::models::AccountCategory::Stocks,
+                            symbol,
+                            amount: position,
+                            currency,
+                            value_native: val_native,
+                        });
+                    }
+                } else if tag == "CashReportCurrency" || tag == "CashSummaryItem" || tag == "ChangeInCash" {
+                    let mut currency = String::new();
+                    let mut ending_cash: f64 = 0.0;
+
+                    for attr in e.attributes().flatten() {
+                        let key = attr.key.as_ref();
+                        let val = attr.value.as_ref().to_string();
+                        match key {
+                            "currency" => currency = val.to_uppercase(),
+                            "endingCash" => ending_cash = val.parse().unwrap_or(0.0),
+                            _ => {}
+                        }
+                    }
+
+                    if !currency.is_empty() && currency != "BASE_SUMMARY" && ending_cash.abs() > 0.0001 {
+                        holdings.push(IbkrHolding {
+                            category: crate::models::AccountCategory::Cash,
+                            symbol: currency.clone(),
+                            amount: ending_cash,
+                            currency,
+                            value_native: ending_cash,
+                        });
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    holdings
 }
 
 fn normalize_kraken_asset(asset: &str) -> String {
@@ -934,6 +1114,76 @@ mod tests {
     async fn test_fetch_kraken_empty_credentials() {
         let providers = Providers::new();
         let res = providers.fetch_kraken_balances("", "").await;
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_ibkr_send_request_xml_success() {
+        let xml = r#"<FlexStatementResponse timestamp="05 September, 2026">
+            <Status>Success</Status>
+            <ReferenceCode>9876543210</ReferenceCode>
+            <Url>https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement</Url>
+        </FlexStatementResponse>"#;
+        let res = parse_ibkr_send_request_xml(xml);
+        assert_eq!(res, Ok("9876543210".to_string()));
+    }
+
+    #[test]
+    fn test_parse_ibkr_send_request_xml_error() {
+        let xml = r#"<FlexStatementResponse timestamp="05 September, 2026">
+            <Status>Warn</Status>
+            <ErrorCode>1018</ErrorCode>
+            <ErrorMessage>Token has expired or is invalid</ErrorMessage>
+        </FlexStatementResponse>"#;
+        let res = parse_ibkr_send_request_xml(xml);
+        assert_eq!(res, Err("Token has expired or is invalid".to_string()));
+    }
+
+    #[test]
+    fn test_parse_ibkr_statement_xml() {
+        let xml = r#"<FlexQueryResponse queryName="Portfolio" type="AF">
+            <FlexStatements count="1">
+                <FlexStatement accountId="U1234567">
+                    <OpenPositions>
+                        <OpenPosition accountId="U1234567" currency="USD" symbol="AAPL" position="10" markPrice="175.50" positionValue="1755.00" />
+                        <OpenPosition accountId="U1234567" currency="CHF" symbol="NESN" position="20" markPrice="98.20" positionValue="1964.00" />
+                    </OpenPositions>
+                    <CashReport>
+                        <CashReportCurrency accountId="U1234567" currency="USD" endingCash="2500.50" />
+                        <CashReportCurrency accountId="U1234567" currency="CHF" endingCash="850.00" />
+                        <CashReportCurrency accountId="U1234567" currency="EUR" endingCash="0.00" />
+                    </CashReport>
+                </FlexStatement>
+            </FlexStatements>
+        </FlexQueryResponse>"#;
+
+        let holdings = parse_ibkr_statement_xml(xml);
+        assert_eq!(holdings.len(), 4);
+        assert_eq!(holdings[0].category, crate::models::AccountCategory::Stocks);
+        assert_eq!(holdings[0].symbol, "AAPL");
+        assert_eq!(holdings[0].amount, 10.0);
+        assert_eq!(holdings[0].currency, "USD");
+        assert_eq!(holdings[0].value_native, 1755.0);
+
+        assert_eq!(holdings[1].category, crate::models::AccountCategory::Stocks);
+        assert_eq!(holdings[1].symbol, "NESN");
+        assert_eq!(holdings[1].amount, 20.0);
+        assert_eq!(holdings[1].currency, "CHF");
+        assert_eq!(holdings[1].value_native, 1964.0);
+
+        assert_eq!(holdings[2].category, crate::models::AccountCategory::Cash);
+        assert_eq!(holdings[2].symbol, "USD");
+        assert_eq!(holdings[2].amount, 2500.50);
+
+        assert_eq!(holdings[3].category, crate::models::AccountCategory::Cash);
+        assert_eq!(holdings[3].symbol, "CHF");
+        assert_eq!(holdings[3].amount, 850.00);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ibkr_empty_credentials() {
+        let providers = Providers::new();
+        let res = providers.fetch_ibkr_holdings("", "").await;
         assert!(res.is_none());
     }
 
