@@ -8,6 +8,7 @@
   "kraken_api_secret": "<kraken_api_secret>",
   "ibkr_flex_token": "<ibkr_flex_token>",
   "ibkr_query_id": "<ibkr_query_id>",
+  "finpension_token": "<finpension_token>",
   "coinmarketcap_urls": [
     "https://coinmarketcap.com/currencies/monero/",
     "https://coinmarketcap.com/currencies/basic-attention-token/",

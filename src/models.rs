@@ -228,7 +228,9 @@ impl AppState {
             } else if norm == "CHF" {
                 self.balances[i].value_native = amount;
                 self.balances[i].native_currency = "CHF".to_string();
-            } else if let Some(price) = self.get_crypto_price(&symbol) {
+            } else if self.balances[i].category == AccountCategory::Crypto
+                && let Some(price) = self.get_crypto_price(&symbol)
+            {
                 self.balances[i].value_native = amount * price;
                 self.balances[i].native_currency = "USD".to_string();
             }

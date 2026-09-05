@@ -747,6 +747,73 @@ impl Providers {
 
         None
     }
+
+    /// Fetch Finpension 3a portfolios (Retirement category)
+    pub async fn fetch_finpension_portfolios(&self, token: &str) -> Option<Vec<(String, f64)>> {
+        if token.trim().is_empty() {
+            return None;
+        }
+
+        let clean_token = token.trim().trim_start_matches("Bearer ").trim();
+        let url = "https://3a.finpension.ch/api/portfolios";
+
+        let resp = self
+            .client
+            .get(url)
+            .header("Authorization", format!("Bearer {clean_token}"))
+            .header("x-app-platform", "web")
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let json = resp.json::<Value>().await.ok()?;
+        parse_finpension_portfolios_json(&json)
+    }
+}
+
+pub fn parse_finpension_portfolios_json(val: &Value) -> Option<Vec<(String, f64)>> {
+    let arr = val
+        .as_array()
+        .or_else(|| val.get("data").and_then(|d| d.as_array()))?;
+
+    let mut results = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(|n| n.as_str())
+            .or_else(|| item.pointer("/strategy/name").and_then(|n| n.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Portfolio {}", i + 1));
+
+        let value = item
+            .pointer("/performance/current_value")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .or_else(|| {
+                item.get("current_value")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            })
+            .or_else(|| {
+                item.get("total_value")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            })
+            .unwrap_or(0.0);
+
+        if value > 0.0 {
+            results.push((name, value));
+        }
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1184,6 +1251,41 @@ mod tests {
     async fn test_fetch_ibkr_empty_credentials() {
         let providers = Providers::new();
         let res = providers.fetch_ibkr_holdings("", "").await;
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_finpension_portfolios_json() {
+        let json = serde_json::json!([
+            {
+                "id": 12345,
+                "name": "Custom Equity 99",
+                "performance": {
+                    "current_value": 35420.75,
+                    "current_profit_value": 4120.50
+                }
+            },
+            {
+                "id": 12346,
+                "strategy": {
+                    "name": "Finpension Equity 100"
+                },
+                "current_value": 18250.00
+            }
+        ]);
+
+        let res = parse_finpension_portfolios_json(&json).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].0, "Custom Equity 99");
+        assert_eq!(res[0].1, 35420.75);
+        assert_eq!(res[1].0, "Finpension Equity 100");
+        assert_eq!(res[1].1, 18250.00);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_finpension_empty_token() {
+        let providers = Providers::new();
+        let res = providers.fetch_finpension_portfolios("").await;
         assert!(res.is_none());
     }
 

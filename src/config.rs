@@ -62,6 +62,9 @@ pub struct Config {
     #[serde(default)]
     pub ibkr_query_id: Option<String>,
 
+    #[serde(default)]
+    pub finpension_token: Option<String>,
+
     #[serde(default = "default_update_freq")]
     pub update_frequency_secs: f64,
 

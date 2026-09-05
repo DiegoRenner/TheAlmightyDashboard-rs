@@ -139,12 +139,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let kraken_secret = config.kraken_api_secret.clone();
         let ibkr_tok = config.ibkr_flex_token.clone();
         let ibkr_qid = config.ibkr_query_id.clone();
+        let finpension_tok = config.finpension_token.clone();
 
         tokio::spawn(async move {
             let mut last_starling_poll: Option<Instant> = None;
             let mut starling_poll_interval = Duration::from_secs(60);
             let mut last_ibkr_poll: Option<Instant> = None;
             let mut ibkr_poll_interval = Duration::from_secs(600);
+            let mut last_finpension_poll: Option<Instant> = None;
+            let mut finpension_poll_interval = Duration::from_secs(600);
 
             loop {
                 // Check Monero balances (MW)
@@ -429,6 +432,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             // Backoff on rate limit or error
                             ibkr_poll_interval = Duration::from_secs(120);
+                        }
+                    }
+                }
+
+                // Check Finpension 3a balances (FP)
+                if let Some(ref tok) = finpension_tok {
+                    let should_poll = !matches!(last_finpension_poll, Some(t) if t.elapsed() < finpension_poll_interval);
+                    if should_poll {
+                        last_finpension_poll = Some(Instant::now());
+                        if let Some(portfolios) = prov.fetch_finpension_portfolios(tok).await {
+                            finpension_poll_interval = Duration::from_secs(600);
+                            let mut fp_items = Vec::new();
+                            for (name, val_chf) in portfolios {
+                                fp_items.push(BalanceItem {
+                                    account: "FP".to_string(),
+                                    category: AccountCategory::Retirement,
+                                    symbol: name,
+                                    amount: val_chf,
+                                    native_currency: "CHF".to_string(),
+                                    value_native: val_chf,
+                                    value_chf: val_chf,
+                                });
+                            }
+                            let mut state = app.write().await;
+                            state.update_account_balances("FP", fp_items);
+                        } else {
+                            // Backoff on rate limit or error
+                            finpension_poll_interval = Duration::from_secs(120);
                         }
                     }
                 }
