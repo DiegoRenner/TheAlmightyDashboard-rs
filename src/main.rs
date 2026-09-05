@@ -91,10 +91,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut state = app.write().await;
                         let pos = offset + idx;
                         if pos < state.tickers.len() {
-                            state.tickers[pos].symbol = symbol;
+                            state.tickers[pos].symbol = symbol.clone();
                             state.tickers[pos].price_str = price_str;
                             state.tickers[pos].price_num = price_num;
                             state.tickers[pos].last_success = Some(Instant::now());
+                        }
+                        if let Some(p) = price_num {
+                            state.set_crypto_price(&symbol, p);
                         }
                         state.update_balance_values();
                     }
@@ -142,9 +145,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for addr in &monero_addrs {
                     if let Some(amt) = prov.fetch_monero_balance(addr).await
                         && amt > 0.0 {
-                            let (xmr_price, fx) = {
+                            let xmr_price = {
+                                let cached = {
+                                    let state = app.read().await;
+                                    state.get_crypto_price("XMR")
+                                };
+                                if let Some(p) = cached {
+                                    p
+                                } else if let Some(p) = prov.fetch_asset_price_usd("XMR").await {
+                                    let mut state = app.write().await;
+                                    state.set_crypto_price("XMR", p);
+                                    p
+                                } else {
+                                    0.0
+                                }
+                            };
+                            let fx = {
                                 let state = app.read().await;
-                                (state.get_crypto_price("XMR").unwrap_or(0.0), state.fx_rates)
+                                state.fx_rates
                             };
                             let val_usd = amt * xmr_price;
                             let val_chf = fx.to_chf("USD", val_usd);
@@ -163,13 +181,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Check Chia balance (CW)
                 if let Some(amt) = prov.fetch_chia_balance(chia_path.as_deref())
                     && amt > 0.0 {
-                        let (cached_price, fx) = {
-                            let state = app.read().await;
-                            (state.get_crypto_price("XCH"), state.fx_rates)
+                        let xch_price = {
+                            let cached = {
+                                let state = app.read().await;
+                                state.get_crypto_price("XCH")
+                            };
+                            if let Some(p) = cached {
+                                p
+                            } else if let Some(p) = prov.fetch_asset_price_usd("XCH").await {
+                                let mut state = app.write().await;
+                                state.set_crypto_price("XCH", p);
+                                p
+                            } else {
+                                1.42
+                            }
                         };
-                        let xch_price = match cached_price {
-                            Some(p) => p,
-                            None => prov.fetch_chia_price().await.unwrap_or(1.42),
+                        let fx = {
+                            let state = app.read().await;
+                            state.fx_rates
                         };
                         let val_usd = amt * xch_price;
                         let val_chf = fx.to_chf("USD", val_usd);
@@ -188,22 +217,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref tok) = uphold_tok {
                     let cards = prov.fetch_uphold_cards(tok).await;
                     for (curr, amt) in cards {
-                        let (native_curr, val_native, val_chf) = {
-                            let state = app.read().await;
-                            let (native_c, val_n) = if curr == "USD" {
-                                ("USD".to_string(), amt)
-                            } else if curr == "EUR" {
-                                ("EUR".to_string(), amt)
-                            } else if curr == "GBP" {
-                                ("GBP".to_string(), amt)
-                            } else if curr == "CHF" {
-                                ("CHF".to_string(), amt)
-                            } else {
-                                let price = state.get_crypto_price(&curr).unwrap_or(0.0);
-                                ("USD".to_string(), amt * price)
+                        let (native_curr, val_native) = if curr == "USD" {
+                            ("USD".to_string(), amt)
+                        } else if curr == "EUR" {
+                            ("EUR".to_string(), amt)
+                        } else if curr == "GBP" {
+                            ("GBP".to_string(), amt)
+                        } else if curr == "CHF" {
+                            ("CHF".to_string(), amt)
+                        } else {
+                            let price = {
+                                let cached = {
+                                    let state = app.read().await;
+                                    state.get_crypto_price(&curr)
+                                };
+                                if let Some(p) = cached {
+                                    p
+                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                    let mut state = app.write().await;
+                                    state.set_crypto_price(&curr, p);
+                                    p
+                                } else {
+                                    0.0
+                                }
                             };
-                            let chf = state.fx_rates.to_chf(&native_c, val_n);
-                            (native_c, val_n, chf)
+                            ("USD".to_string(), amt * price)
+                        };
+                        let val_chf = {
+                            let state = app.read().await;
+                            state.fx_rates.to_chf(&native_curr, val_native)
                         };
                         new_balances.push(BalanceItem {
                             account: "UH".to_string(),
@@ -220,19 +262,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Check Coinbase balances (CB)
                 if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret) {
                     let cb_balances = prov.fetch_coinbase_balances(key, secret).await;
-                    let fx = {
-                        let state = app.read().await;
-                        state.fx_rates
-                    };
-                    for (curr, amt, val_usd) in cb_balances {
-                        let val_chf = fx.to_chf("USD", val_usd);
+                    for (curr, amt, _) in cb_balances {
+                        let (native_curr, val_native) = if curr == "USD" || curr == "USDC" {
+                            ("USD".to_string(), amt)
+                        } else {
+                            let price = {
+                                let cached = {
+                                    let state = app.read().await;
+                                    state.get_crypto_price(&curr)
+                                };
+                                if let Some(p) = cached {
+                                    p
+                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                    let mut state = app.write().await;
+                                    state.set_crypto_price(&curr, p);
+                                    p
+                                } else {
+                                    0.0
+                                }
+                            };
+                            ("USD".to_string(), amt * price)
+                        };
+                        let val_chf = {
+                            let state = app.read().await;
+                            state.fx_rates.to_chf(&native_curr, val_native)
+                        };
                         new_balances.push(BalanceItem {
                             account: "CB".to_string(),
                             category: AccountCategory::Crypto,
                             symbol: curr,
                             amount: amt,
-                            native_currency: "USD".to_string(),
-                            value_native: val_usd,
+                            native_currency: native_curr,
+                            value_native: val_native,
                             value_chf: val_chf,
                         });
                     }
@@ -263,22 +324,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret) {
                     let kraken_balances = prov.fetch_kraken_balances(key, secret).await;
                     for (curr, amt) in kraken_balances {
-                        let (native_curr, val_native, val_chf) = {
-                            let state = app.read().await;
-                            let (nc, vn) = if curr == "USD" {
-                                ("USD".to_string(), amt)
-                            } else if curr == "CHF" {
-                                ("CHF".to_string(), amt)
-                            } else if curr == "EUR" {
-                                ("EUR".to_string(), amt)
-                            } else if curr == "GBP" {
-                                ("GBP".to_string(), amt)
-                            } else {
-                                let price = state.get_crypto_price(&curr).unwrap_or(0.0);
-                                ("USD".to_string(), amt * price)
+                        let (native_curr, val_native) = if curr == "USD" {
+                            ("USD".to_string(), amt)
+                        } else if curr == "CHF" {
+                            ("CHF".to_string(), amt)
+                        } else if curr == "EUR" {
+                            ("EUR".to_string(), amt)
+                        } else if curr == "GBP" {
+                            ("GBP".to_string(), amt)
+                        } else {
+                            let price = {
+                                let cached = {
+                                    let state = app.read().await;
+                                    state.get_crypto_price(&curr)
+                                };
+                                if let Some(p) = cached {
+                                    p
+                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                    let mut state = app.write().await;
+                                    state.set_crypto_price(&curr, p);
+                                    p
+                                } else {
+                                    0.0
+                                }
                             };
-                            let chf = state.fx_rates.to_chf(&nc, vn);
-                            (nc, vn, chf)
+                            ("USD".to_string(), amt * price)
+                        };
+                        let val_chf = {
+                            let state = app.read().await;
+                            state.fx_rates.to_chf(&native_curr, val_native)
                         };
                         new_balances.push(BalanceItem {
                             account: "Kraken".to_string(),
@@ -291,6 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 }
+
 
                 {
                     let mut state = app.write().await;

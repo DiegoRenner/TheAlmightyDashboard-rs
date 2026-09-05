@@ -100,6 +100,7 @@ pub struct AppState {
     pub tickers: Vec<TickerItem>,
     pub balances: Vec<BalanceItem>,
     pub fx_rates: FxRates,
+    pub price_cache: std::collections::HashMap<String, f64>,
     pub scroll_offset: usize,
     pub should_quit: bool,
 }
@@ -119,6 +120,7 @@ impl AppState {
             tickers,
             balances: Vec::new(),
             fx_rates: FxRates::default(),
+            price_cache: std::collections::HashMap::new(),
             scroll_offset: 0,
             should_quit: false,
         }
@@ -187,6 +189,12 @@ impl AppState {
 
     pub fn get_crypto_price(&self, symbol: &str) -> Option<f64> {
         let sym_norm = normalize_crypto_symbol(symbol);
+        if sym_norm == "USD" {
+            return Some(1.0);
+        }
+        if let Some(&p) = self.price_cache.get(&sym_norm) {
+            return Some(p);
+        }
         for t in &self.tickers {
             if normalize_crypto_symbol(&t.symbol) == sym_norm
                 && let Some(p) = t.price_num {
@@ -194,6 +202,11 @@ impl AppState {
                 }
         }
         None
+    }
+
+    pub fn set_crypto_price(&mut self, symbol: &str, price: f64) {
+        let sym_norm = normalize_crypto_symbol(symbol);
+        self.price_cache.insert(sym_norm, price);
     }
 
     pub fn update_balance_values(&mut self) {
@@ -226,17 +239,19 @@ impl AppState {
 
 }
 
-fn normalize_crypto_symbol(sym: &str) -> String {
+pub fn normalize_crypto_symbol(sym: &str) -> String {
     match sym.to_uppercase().as_str() {
         "XMR" | "MONERO" => "XMR".to_string(),
         "BTC" | "BITCOIN" => "BTC".to_string(),
         "ETH" | "ETHEREUM" => "ETH".to_string(),
         "BAT" | "BASIC-ATTENTION-TOKEN" => "BAT".to_string(),
         "XCH" | "CHIA" | "CHIA-NETWORK" => "XCH".to_string(),
-        "USDC" | "USD" => "USD".to_string(),
+        "DOGE" | "DOGECOIN" => "DOGE".to_string(),
+        "USDC" | "USD" | "USDT" => "USD".to_string(),
         other => other.to_string(),
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -303,5 +318,53 @@ mod tests {
         assert_eq!(state.stocks_and_cash_total_chf(), 1100.0);
         assert_eq!(state.total_net_worth_chf(), 29180.0);
     }
+
+    #[test]
+    fn test_update_balance_values_with_tickers() {
+        let mut state = AppState::new(
+            vec!["https://coinmarketcap.com/currencies/monero/".to_string(), "https://coinmarketcap.com/currencies/ethereum/".to_string()],
+            vec![]
+        );
+        state.fx_rates = FxRates {
+            usd_to_chf: 0.81,
+            eur_to_chf: 0.94,
+            gbp_to_chf: 1.09,
+        };
+
+        state.balances.push(BalanceItem {
+            account: "MW".to_string(),
+            category: AccountCategory::Crypto,
+            symbol: "XMR".to_string(),
+            amount: 9.38,
+            native_currency: "USD".to_string(),
+            value_native: 0.0,
+            value_chf: 0.0,
+        });
+        state.balances.push(BalanceItem {
+            account: "UH".to_string(),
+            category: AccountCategory::Crypto,
+            symbol: "ETH".to_string(),
+            amount: 0.00865,
+            native_currency: "USD".to_string(),
+            value_native: 0.0,
+            value_chf: 0.0,
+        });
+
+        // BEFORE tickers fetch prices:
+        state.update_balance_values();
+        assert_eq!(state.balances[0].value_chf, 0.0);
+
+        // AFTER ticker prices fetched:
+        state.tickers[0].symbol = "XMR".to_string();
+        state.tickers[0].price_num = Some(530.0);
+        state.tickers[1].symbol = "ETH".to_string();
+        state.tickers[1].price_num = Some(2450.0);
+
+        state.update_balance_values();
+        println!("After ticker prices: XMR val_chf={}, ETH val_chf={}", state.balances[0].value_chf, state.balances[1].value_chf);
+        assert!(state.balances[0].value_chf > 0.0);
+        assert!(state.balances[1].value_chf > 0.0);
+    }
 }
+
 

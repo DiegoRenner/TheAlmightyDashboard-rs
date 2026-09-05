@@ -79,48 +79,55 @@ impl Providers {
             target.trim().to_lowercase()
         };
 
+        let sym = slug_to_symbol(&slug);
+
+        // 1. First priority: Direct Yahoo Finance query with canonical symbol (fast, reliable ~20ms)
+        if let Some(price) = self.fetch_fx_rate(&format!("{sym}-USD")).await {
+            return (sym, format_price(price), Some(price));
+        }
+
+        // 2. Second priority: CoinMarketCap __NEXT_DATA__
         let url = if target.starts_with("http://") || target.starts_with("https://") {
             target.to_string()
         } else {
             format!("https://coinmarketcap.com/currencies/{slug}/")
         };
 
-        // 1. Try CoinMarketCap __NEXT_DATA__
         if let Ok(resp) = self.client.get(&url).send().await
             && resp.status().is_success()
-                && let Ok(html) = resp.text().await
-                    && let Some(next_data) = extract_next_data(&html)
-                        && let Ok(json) = serde_json::from_str::<Value>(&next_data) {
-                            let detail = &json["props"]["pageProps"]["detailRes"]["detail"];
-                            let symbol = detail["symbol"].as_str().map(|s| s.to_string());
-                            let price = detail["statistics"]["price"].as_f64();
+            && let Ok(html) = resp.text().await
+            && let Some(next_data) = extract_next_data(&html)
+            && let Ok(json) = serde_json::from_str::<Value>(&next_data) {
+                let detail = &json["props"]["pageProps"]["detailRes"]["detail"];
+                let symbol = detail["symbol"].as_str().map(|s| s.to_string()).unwrap_or_else(|| sym.clone());
+                let price = detail["statistics"]["price"].as_f64();
 
-                            if let (Some(sym), Some(p)) = (symbol, price) {
-                                return (sym, format_price(p), Some(p));
-                            }
-                        }
+                if let Some(p) = price {
+                    return (symbol, format_price(p), Some(p));
+                }
+            }
 
-        // 2. Fallback: CoinGecko simple price API
+        // 3. Fallback: CoinGecko simple price API
         let cg_url = format!("https://api.coingecko.com/api/v3/simple/price?ids={slug}&vs_currencies=usd");
         if let Ok(resp) = self.client.get(&cg_url).send().await
             && resp.status().is_success()
-                && let Ok(json) = resp.json::<Value>().await
-                    && let Some(price) = json.get(&slug).and_then(|c| c.get("usd")).and_then(|u| u.as_f64()) {
-                        return (slug.to_uppercase(), format_price(price), Some(price));
-                    }
+            && let Ok(json) = resp.json::<Value>().await
+            && let Some(price) = json.get(&slug).and_then(|c| c.get("usd")).and_then(|u| u.as_f64()) {
+                return (sym, format_price(price), Some(price));
+            }
 
-        // 3. Fallback: Yahoo Finance crypto chart
-        let yf_url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}-USD", slug.to_uppercase());
-        if let Ok(resp) = self.client.get(&yf_url).send().await
-            && resp.status().is_success()
-                && let Ok(json) = resp.json::<Value>().await
-                    && let Some(results) = json["chart"]["result"].as_array()
-                        && let Some(price) = results.first().and_then(|r| r["meta"]["regularMarketPrice"].as_f64()) {
-                            return (slug.to_uppercase(), format_price(price), Some(price));
-                        }
-
-        (slug.to_uppercase(), "FAILED".to_string(), None)
+        (sym, "FAILED".to_string(), None)
     }
+
+    /// Fetch asset price in USD dynamically for any cryptocurrency or stablecoin
+    pub async fn fetch_asset_price_usd(&self, symbol: &str) -> Option<f64> {
+        let sym_norm = crate::models::normalize_crypto_symbol(symbol);
+        if sym_norm == "USD" {
+            return Some(1.0);
+        }
+        self.fetch_fx_rate(&format!("{sym_norm}-USD")).await
+    }
+
 
     /// Fetch Monero balance: MoneroOcean pool pending due + local RPC daemon
     pub async fn fetch_monero_balance(&self, address: &str) -> Option<f64> {
@@ -520,11 +527,6 @@ impl Providers {
         Some(total_xch)
     }
 
-    /// Fetch live Chia (XCH) USD price from Yahoo Finance
-    pub async fn fetch_chia_price(&self) -> Option<f64> {
-        self.fetch_fx_rate("XCH-USD").await
-    }
-
     /// Fetch Starling Bank account balances
     pub async fn fetch_starling_balances(&self, token: &str) -> Vec<(String, f64)> {
         let mut results = Vec::new();
@@ -714,6 +716,31 @@ fn normalize_kraken_asset(asset: &str) -> String {
     }
 }
 
+pub fn slug_to_symbol(slug: &str) -> String {
+    match slug.to_lowercase().as_str() {
+        "monero" => "XMR".to_string(),
+        "bitcoin" => "BTC".to_string(),
+        "ethereum" => "ETH".to_string(),
+        "basic-attention-token" => "BAT".to_string(),
+        "dogecoin" => "DOGE".to_string(),
+        "chia" | "chia-network" => "XCH".to_string(),
+        "the-graph" => "GRT".to_string(),
+        "stellar" => "XLM".to_string(),
+        "compound" => "COMP".to_string(),
+        "numeraire" => "NMR".to_string(),
+        "nucypher" => "NU".to_string(),
+        "polygon" => "MATIC".to_string(),
+        "skale-network" => "SKL".to_string(),
+        "presearch" => "PRE".to_string(),
+        "ampleforth" => "AMPL".to_string(),
+        "celo" => "CELO".to_string(),
+        "uma" => "UMA".to_string(),
+        "grin" => "GRIN".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+
 
 fn find_first_chia_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -798,12 +825,49 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_crypto_live() {
         let providers = Providers::new();
-        let (symbol, price_str, price_num) = providers.fetch_crypto("https://coinmarketcap.com/currencies/bitcoin/").await;
-        assert!(symbol == "BTC" || symbol == "BITCOIN");
-        assert_ne!(price_str, "FAILED");
+        let (btc_sym, btc_str, btc_num) = providers.fetch_crypto("https://coinmarketcap.com/currencies/bitcoin/").await;
+        println!("Live BTC: sym={}, str={}, num={:?}", btc_sym, btc_str, btc_num);
 
-        assert!(price_num.is_some());
+        let (xmr_sym, xmr_str, xmr_num) = providers.fetch_crypto("https://coinmarketcap.com/currencies/monero/").await;
+        println!("Live XMR: sym={}, str={}, num={:?}", xmr_sym, xmr_str, xmr_num);
+
+        let (eth_sym, eth_str, eth_num) = providers.fetch_crypto("https://coinmarketcap.com/currencies/ethereum/").await;
+        println!("Live ETH: sym={}, str={}, num={:?}", eth_sym, eth_str, eth_num);
+
+        assert!(btc_num.is_some());
+        assert!(xmr_num.is_some());
+        assert!(eth_num.is_some());
     }
+
+    #[test]
+    fn test_slug_to_symbol() {
+        assert_eq!(slug_to_symbol("monero"), "XMR");
+        assert_eq!(slug_to_symbol("ethereum"), "ETH");
+        assert_eq!(slug_to_symbol("bitcoin"), "BTC");
+        assert_eq!(slug_to_symbol("basic-attention-token"), "BAT");
+        assert_eq!(slug_to_symbol("dogecoin"), "DOGE");
+        assert_eq!(slug_to_symbol("chia"), "XCH");
+        assert_eq!(slug_to_symbol("the-graph"), "GRT");
+        assert_eq!(slug_to_symbol("stellar"), "XLM");
+        assert_eq!(slug_to_symbol("atom"), "ATOM");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_asset_price_usd() {
+        let providers = Providers::new();
+        let usd = providers.fetch_asset_price_usd("USD").await;
+        assert_eq!(usd, Some(1.0));
+
+        let usdc = providers.fetch_asset_price_usd("USDC").await;
+        assert_eq!(usdc, Some(1.0));
+
+        let xmr = providers.fetch_asset_price_usd("XMR").await;
+        assert!(xmr.is_some() && xmr.unwrap() > 0.0);
+
+        let eth = providers.fetch_asset_price_usd("ETH").await;
+        assert!(eth.is_some() && eth.unwrap() > 0.0);
+    }
+
 
     #[tokio::test]
     async fn test_fetch_coinbase_live() {
@@ -812,8 +876,9 @@ mod tests {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
                 if let (Some(key), Some(secret)) = (v.get("coinbase_api_key").and_then(|k| k.as_str()), v.get("coinbase_api_secret").and_then(|s| s.as_str())) {
                     let balances = providers.fetch_coinbase_balances(key, secret).await;
-                    println!("Fetched {} Coinbase accounts", balances.len());
+                    println!("Fetched {} Coinbase accounts: {:?}", balances.len(), balances);
                     assert!(!balances.is_empty());
+
                 }
             }
         }
