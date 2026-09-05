@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 state.set_crypto_price("XCH", p);
                                 p
                             } else {
-                                1.42
+                                0.0
                             }
                         };
                         let fx = {
