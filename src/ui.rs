@@ -137,8 +137,8 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
             Row::new(vec![
                 Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(item.symbol.clone()).style(Style::default().fg(Color::Yellow)),
-                Cell::from(format!("{:.4}", item.amount)).style(Style::default().fg(Color::White)),
-                Cell::from(format!("{:.2}", item.value_usd)).style(Style::default().fg(Color::Green)),
+                Cell::from(format_balance_amount(item.amount)).style(Style::default().fg(Color::White)),
+                Cell::from(format_balance_value(item.value_usd)).style(Style::default().fg(Color::Green)),
             ])
         })
         .collect();
@@ -173,4 +173,24 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     );
 
     f.render_widget(table, area);
+}
+
+fn format_balance_amount(amount: f64) -> String {
+    if amount == 0.0 {
+        "0.00".to_string()
+    } else if amount >= 0.0001 {
+        format!("{:.4}", amount)
+    } else {
+        format!("{:.8}", amount)
+    }
+}
+
+fn format_balance_value(val: f64) -> String {
+    if val == 0.0 {
+        "0.00".to_string()
+    } else if val >= 0.01 {
+        format!("{:.2}", val)
+    } else {
+        format!("{:.4}", val)
+    }
 }
