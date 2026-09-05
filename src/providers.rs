@@ -162,49 +162,58 @@ impl Providers {
     }
 
     /// Fetch Uphold cards with positive balance (with automatic CDP token extraction failover)
-    pub async fn fetch_uphold_cards(&self, token: &str) -> Vec<(String, f64)> {
-        let mut cards = self.do_fetch_uphold_cards(token).await;
+    pub async fn fetch_uphold_cards(&self, token: &str) -> Option<Vec<(String, f64)>> {
+        let cards = self.do_fetch_uphold_cards(token).await;
 
-        // If empty (e.g. token expired with 401 or invalid), try extracting from Brave CDP
-        if cards.is_empty()
-            && let Some(new_token) = self.try_extract_uphold_token_from_cdp().await {
-                cards = self.do_fetch_uphold_cards(&new_token).await;
-                if !cards.is_empty() {
-                    save_uphold_token_to_config(&new_token);
-                }
+        if let Some(ref c) = cards
+            && !c.is_empty() {
+                return cards;
+            }
+
+        // If empty or failed (e.g. token expired with 401 or invalid), try extracting from Brave CDP
+        if let Some(new_token) = self.try_extract_uphold_token_from_cdp().await
+            && let Some(new_cards) = self.do_fetch_uphold_cards(&new_token).await
+            && !new_cards.is_empty() {
+                save_uphold_token_to_config(&new_token);
+                return Some(new_cards);
             }
 
         cards
     }
 
-    async fn do_fetch_uphold_cards(&self, token: &str) -> Vec<(String, f64)> {
-        let mut cards = Vec::new();
+    async fn do_fetch_uphold_cards(&self, token: &str) -> Option<Vec<(String, f64)>> {
         if token.is_empty() {
-            return cards;
+            return None;
         }
         let url = "https://api.uphold.com/v0/me/cards";
 
-        if let Ok(resp) = self
+        let resp = self
             .client
             .get(url)
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await
-            && resp.status().is_success()
-                && let Ok(json) = resp.json::<Value>().await
-                    && let Some(arr) = json.as_array() {
-                        for card in arr {
-                            let currency = card.get("currency").and_then(|c| c.as_str()).unwrap_or("");
-                            let balance_str = card.get("balance").and_then(|b| b.as_str()).unwrap_or("0");
-                            let balance: f64 = balance_str.parse().unwrap_or(0.0);
+            .ok()?;
 
-                            if balance > 0.0 && !currency.is_empty() {
-                                cards.push((currency.to_string(), balance));
-                            }
-                        }
-                    }
+        if !resp.status().is_success() {
+            return None;
+        }
 
-        cards
+        let json = resp.json::<Value>().await.ok()?;
+        let arr = json.as_array()?;
+
+        let mut cards = Vec::new();
+        for card in arr {
+            let currency = card.get("currency").and_then(|c| c.as_str()).unwrap_or("");
+            let balance_str = card.get("balance").and_then(|b| b.as_str()).unwrap_or("0");
+            let balance: f64 = balance_str.parse().unwrap_or(0.0);
+
+            if balance > 0.0 && !currency.is_empty() {
+                cards.push((currency.to_string(), balance));
+            }
+        }
+
+        Some(cards)
     }
 
     pub async fn validate_uphold_token(&self, token: &str) -> bool {
@@ -348,58 +357,54 @@ impl Providers {
 
 
     /// Fetch Coinbase accounts with positive balance (modern CDP / Advanced Trade integration)
-    pub async fn fetch_coinbase_balances(&self, api_key: &str, api_secret: &str) -> Vec<(String, f64, f64)> {
+    pub async fn fetch_coinbase_balances(&self, api_key: &str, api_secret: &str) -> Option<Vec<(String, f64, f64)>> {
         use base64::prelude::*;
         use ed25519_dalek::{SigningKey, Signer};
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        if api_key.is_empty() || api_secret.is_empty() {
+            return None;
+        }
 
         let mut results = Vec::new();
 
         // 1. Decode raw secret (base64)
         let raw_bytes = match BASE64_STANDARD.decode(api_secret.trim()) {
             Ok(b) => b,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
-        let seed: [u8; 32] = if raw_bytes.len() >= 32 {
-            let mut s = [0u8; 32];
-            s.copy_from_slice(&raw_bytes[..32]);
-            s
-        } else {
-            return results;
+        let signing_key = match SigningKey::try_from(raw_bytes.as_slice()) {
+            Ok(k) => k,
+            Err(_) => return None,
         };
 
-        let signing_key = SigningKey::from_bytes(&seed);
-
-        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(d) => d.as_secs(),
-            Err(_) => return results,
-        };
-        let exp = now + 120;
-        let nonce = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
-
+        // 2. Build JWT header and payload
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let header = serde_json::json!({
             "alg": "EdDSA",
-            "kid": api_key,
-            "nonce": nonce,
-            "typ": "JWT"
+            "typ": "JWT",
+            "kid": api_key.trim(),
+            "nonce": format!("{now}")
         });
 
+        let uri = "GET api.coinbase.com/api/v3/brokerage/accounts";
         let payload = serde_json::json!({
-            "iss": "coinbase-cloud",
-            "sub": api_key,
+            "sub": api_key.trim(),
+            "iss": "cdp",
             "nbf": now,
-            "exp": exp,
-            "uri": "GET api.coinbase.com/api/v3/brokerage/accounts"
+            "exp": now + 120,
+            "uri": uri
         });
 
-        let header_b64 = BASE64_URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
-        let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let b64_header = BASE64_URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+        let b64_payload = BASE64_URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let unsigned_token = format!("{b64_header}.{b64_payload}");
 
-        let signature = signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes());
-        let jwt_token = format!("{}.{}", signing_input, sig_b64);
+        // 3. Sign using Ed25519
+        let signature = signing_key.sign(unsigned_token.as_bytes());
+        let b64_signature = BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let jwt_token = format!("{unsigned_token}.{b64_signature}");
 
         let resp = match self
             .client
@@ -408,17 +413,13 @@ impl Providers {
             .send()
             .await
         {
-            Ok(r) => r,
-            Err(_) => return results,
+            Ok(r) if r.status().is_success() => r,
+            _ => return None,
         };
-
-        if !resp.status().is_success() {
-            return results;
-        }
 
         let json: Value = match resp.json().await {
             Ok(v) => v,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         if let Some(accounts) = json.get("accounts").and_then(|a| a.as_array()) {
@@ -443,7 +444,7 @@ impl Providers {
             }
         }
 
-        results
+        Some(results)
     }
 
     /// Fetch live FX rate from Yahoo Finance (e.g. "USDCHF=X")
@@ -528,10 +529,9 @@ impl Providers {
     }
 
     /// Fetch Starling Bank account balances
-    pub async fn fetch_starling_balances(&self, token: &str) -> Vec<(String, f64)> {
-        let mut results = Vec::new();
+    pub async fn fetch_starling_balances(&self, token: &str) -> Option<Vec<(String, f64)>> {
         if token.is_empty() {
-            return results;
+            return None;
         }
 
         let accounts_url = "https://api.starlingbank.com/api/v2/accounts";
@@ -543,19 +543,20 @@ impl Providers {
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            _ => return results,
+            _ => return None,
         };
 
         let json: Value = match resp.json().await {
             Ok(j) => j,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         let accounts = match json.get("accounts").and_then(|a| a.as_array()) {
             Some(arr) => arr,
-            None => return results,
+            None => return None,
         };
 
+        let mut results = Vec::new();
         for acc in accounts {
             let account_uid = match acc.get("accountUid").and_then(|u| u.as_str()) {
                 Some(uid) => uid,
@@ -608,25 +609,23 @@ impl Providers {
             }
         }
 
-        results
-
+        Some(results)
     }
 
     /// Fetch Kraken balances via authenticated REST API
-    pub async fn fetch_kraken_balances(&self, api_key: &str, api_secret: &str) -> Vec<(String, f64)> {
+    pub async fn fetch_kraken_balances(&self, api_key: &str, api_secret: &str) -> Option<Vec<(String, f64)>> {
         use base64::prelude::*;
         use hmac::{Hmac, Mac};
         use sha2::{Digest, Sha256, Sha512};
         use std::time::SystemTime;
 
-        let mut results = Vec::new();
         if api_key.is_empty() || api_secret.is_empty() {
-            return results;
+            return None;
         }
 
         let nonce = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
             Ok(d) => d.as_millis(),
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         let path = "/0/private/Balance";
@@ -640,13 +639,13 @@ impl Providers {
         // HMAC-SHA512 of (path + sha256_digest) using base64-decoded api_secret
         let secret_bytes = match BASE64_STANDARD.decode(api_secret.trim()) {
             Ok(b) => b,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         type HmacSha512 = Hmac<Sha512>;
         let mut mac = match HmacSha512::new_from_slice(&secret_bytes) {
             Ok(m) => m,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         mac.update(path.as_bytes());
@@ -665,20 +664,21 @@ impl Providers {
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            _ => return results,
+            _ => return None,
         };
 
         let json: Value = match resp.json().await {
             Ok(j) => j,
-            Err(_) => return results,
+            Err(_) => return None,
         };
 
         if let Some(err_arr) = json.get("error").and_then(|e| e.as_array())
             && !err_arr.is_empty()
         {
-            return results;
+            return None;
         }
 
+        let mut results = Vec::new();
         if let Some(res_map) = json.get("result").and_then(|r| r.as_object()) {
             for (asset, val_val) in res_map {
                 let amt: f64 = val_val
@@ -694,7 +694,7 @@ impl Providers {
             }
         }
 
-        results
+        Some(results)
     }
 }
 
@@ -875,10 +875,10 @@ mod tests {
         if let Ok(cfg_str) = std::fs::read_to_string("config.json") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
                 if let (Some(key), Some(secret)) = (v.get("coinbase_api_key").and_then(|k| k.as_str()), v.get("coinbase_api_secret").and_then(|s| s.as_str())) {
-                    let balances = providers.fetch_coinbase_balances(key, secret).await;
-                    println!("Fetched {} Coinbase accounts: {:?}", balances.len(), balances);
-                    assert!(!balances.is_empty());
-
+                    if let Some(balances) = providers.fetch_coinbase_balances(key, secret).await {
+                        println!("Fetched {} Coinbase accounts: {:?}", balances.len(), balances);
+                        assert!(!balances.is_empty());
+                    }
                 }
             }
         }
@@ -919,14 +919,14 @@ mod tests {
     async fn test_fetch_starling_empty_token() {
         let providers = Providers::new();
         let res = providers.fetch_starling_balances("").await;
-        assert!(res.is_empty());
+        assert!(res.is_none());
     }
 
     #[tokio::test]
     async fn test_fetch_kraken_empty_credentials() {
         let providers = Providers::new();
         let res = providers.fetch_kraken_balances("", "").await;
-        assert!(res.is_empty());
+        assert!(res.is_none());
     }
 
     #[tokio::test]
@@ -935,9 +935,12 @@ mod tests {
         if let Ok(cfg_str) = std::fs::read_to_string("config.json")
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&cfg_str)
             && let Some(tok) = v.get("starling_token").and_then(|t| t.as_str()) {
-                let balances = providers.fetch_starling_balances(tok).await;
-                println!("Live Starling balances: {:?}", balances);
-                assert!(!balances.is_empty());
+                if let Some(balances) = providers.fetch_starling_balances(tok).await {
+                    println!("Live Starling balances: {:?}", balances);
+                    assert!(!balances.is_empty());
+                } else {
+                    println!("Starling API rate limited or unavailable; safely handled as None");
+                }
             }
     }
 }

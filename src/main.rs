@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.coinmarketcap_urls.clone(),
         config.marketwatch_urls.clone(),
     )));
+    app_state.write().await.load_balance_cache();
 
     // Setup terminal with panic hook for safe recovery
     setup_panic_hook();
@@ -138,10 +139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let kraken_secret = config.kraken_api_secret.clone();
 
         tokio::spawn(async move {
-            loop {
-                let mut new_balances = Vec::new();
+            let mut last_starling_poll: Option<Instant> = None;
+            let mut starling_poll_interval = Duration::from_secs(60);
 
+            loop {
                 // Check Monero balances (MW)
+                let mut mw_items = Vec::new();
                 for addr in &monero_addrs {
                     if let Some(amt) = prov.fetch_monero_balance(addr).await
                         && amt > 0.0 {
@@ -166,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let val_usd = amt * xmr_price;
                             let val_chf = fx.to_chf("USD", val_usd);
-                            new_balances.push(BalanceItem {
+                            mw_items.push(BalanceItem {
                                 account: "MW".to_string(),
                                 category: AccountCategory::Crypto,
                                 symbol: "XMR".to_string(),
@@ -176,6 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 value_chf: val_chf,
                             });
                         }
+                }
+                if !mw_items.is_empty() {
+                    let mut state = app.write().await;
+                    state.update_account_balances("MW", mw_items);
                 }
 
                 // Check Chia balance (CW)
@@ -202,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let val_usd = amt * xch_price;
                         let val_chf = fx.to_chf("USD", val_usd);
-                        new_balances.push(BalanceItem {
+                        let cw_items = vec![BalanceItem {
                             account: "CW".to_string(),
                             category: AccountCategory::Crypto,
                             symbol: "XCH".to_string(),
@@ -210,171 +217,191 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             native_currency: "USD".to_string(),
                             value_native: val_usd,
                             value_chf: val_chf,
-                        });
+                        }];
+                        let mut state = app.write().await;
+                        state.update_account_balances("CW", cw_items);
                     }
 
                 // Check Uphold balances (UH)
-                if let Some(ref tok) = uphold_tok {
-                    let cards = prov.fetch_uphold_cards(tok).await;
-                    for (curr, amt) in cards {
-                        let (native_curr, val_native) = if curr == "USD" {
-                            ("USD".to_string(), amt)
-                        } else if curr == "EUR" {
-                            ("EUR".to_string(), amt)
-                        } else if curr == "GBP" {
-                            ("GBP".to_string(), amt)
-                        } else if curr == "CHF" {
-                            ("CHF".to_string(), amt)
-                        } else {
-                            let price = {
-                                let cached = {
-                                    let state = app.read().await;
-                                    state.get_crypto_price(&curr)
+                if let Some(ref tok) = uphold_tok
+                    && let Some(cards) = prov.fetch_uphold_cards(tok).await {
+                        let mut uh_items = Vec::new();
+                        for (curr, amt) in cards {
+                            let (native_curr, val_native) = if curr == "USD" {
+                                ("USD".to_string(), amt)
+                            } else if curr == "EUR" {
+                                ("EUR".to_string(), amt)
+                            } else if curr == "GBP" {
+                                ("GBP".to_string(), amt)
+                            } else if curr == "CHF" {
+                                ("CHF".to_string(), amt)
+                            } else {
+                                let price = {
+                                    let cached = {
+                                        let state = app.read().await;
+                                        state.get_crypto_price(&curr)
+                                    };
+                                    if let Some(p) = cached {
+                                        p
+                                    } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                        let mut state = app.write().await;
+                                        state.set_crypto_price(&curr, p);
+                                        p
+                                    } else {
+                                        0.0
+                                    }
                                 };
-                                if let Some(p) = cached {
-                                    p
-                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
-                                    let mut state = app.write().await;
-                                    state.set_crypto_price(&curr, p);
-                                    p
-                                } else {
-                                    0.0
-                                }
+                                ("USD".to_string(), amt * price)
                             };
-                            ("USD".to_string(), amt * price)
-                        };
-                        let val_chf = {
-                            let state = app.read().await;
-                            state.fx_rates.to_chf(&native_curr, val_native)
-                        };
-                        new_balances.push(BalanceItem {
-                            account: "UH".to_string(),
-                            category: AccountCategory::Crypto,
-                            symbol: curr,
-                            amount: amt,
-                            native_currency: native_curr,
-                            value_native: val_native,
-                            value_chf: val_chf,
-                        });
+                            let val_chf = {
+                                let state = app.read().await;
+                                state.fx_rates.to_chf(&native_curr, val_native)
+                            };
+                            uh_items.push(BalanceItem {
+                                account: "UH".to_string(),
+                                category: AccountCategory::Crypto,
+                                symbol: curr,
+                                amount: amt,
+                                native_currency: native_curr,
+                                value_native: val_native,
+                                value_chf: val_chf,
+                            });
+                        }
+                        let mut state = app.write().await;
+                        state.update_account_balances("UH", uh_items);
                     }
-                }
 
                 // Check Coinbase balances (CB)
-                if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret) {
-                    let cb_balances = prov.fetch_coinbase_balances(key, secret).await;
-                    for (curr, amt, _) in cb_balances {
-                        let (native_curr, val_native) = if curr == "USD" || curr == "USDC" {
-                            ("USD".to_string(), amt)
-                        } else {
-                            let price = {
-                                let cached = {
-                                    let state = app.read().await;
-                                    state.get_crypto_price(&curr)
+                if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret)
+                    && let Some(cb_balances) = prov.fetch_coinbase_balances(key, secret).await {
+                        let mut cb_items = Vec::new();
+                        for (curr, amt, _) in cb_balances {
+                            let (native_curr, val_native) = if curr == "USD" || curr == "USDC" {
+                                ("USD".to_string(), amt)
+                            } else {
+                                let price = {
+                                    let cached = {
+                                        let state = app.read().await;
+                                        state.get_crypto_price(&curr)
+                                    };
+                                    if let Some(p) = cached {
+                                        p
+                                    } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                        let mut state = app.write().await;
+                                        state.set_crypto_price(&curr, p);
+                                        p
+                                    } else {
+                                        0.0
+                                    }
                                 };
-                                if let Some(p) = cached {
-                                    p
-                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
-                                    let mut state = app.write().await;
-                                    state.set_crypto_price(&curr, p);
-                                    p
-                                } else {
-                                    0.0
-                                }
+                                ("USD".to_string(), amt * price)
                             };
-                            ("USD".to_string(), amt * price)
-                        };
-                        let val_chf = {
-                            let state = app.read().await;
-                            state.fx_rates.to_chf(&native_curr, val_native)
-                        };
-                        new_balances.push(BalanceItem {
-                            account: "CB".to_string(),
-                            category: AccountCategory::Crypto,
-                            symbol: curr,
-                            amount: amt,
-                            native_currency: native_curr,
-                            value_native: val_native,
-                            value_chf: val_chf,
-                        });
+                            let val_chf = {
+                                let state = app.read().await;
+                                state.fx_rates.to_chf(&native_curr, val_native)
+                            };
+                            cb_items.push(BalanceItem {
+                                account: "CB".to_string(),
+                                category: AccountCategory::Crypto,
+                                symbol: curr,
+                                amount: amt,
+                                native_currency: native_curr,
+                                value_native: val_native,
+                                value_chf: val_chf,
+                            });
+                        }
+                        let mut state = app.write().await;
+                        state.update_account_balances("CB", cb_items);
                     }
-                }
 
                 // Check Starling Bank balances (ST)
                 if let Some(ref tok) = starling_tok {
-                    let st_balances = prov.fetch_starling_balances(tok).await;
-                    let fx = {
-                        let state = app.read().await;
-                        state.fx_rates
-                    };
-                    for (curr, amt) in st_balances {
-                        let val_chf = fx.to_chf(&curr, amt);
-                        new_balances.push(BalanceItem {
-                            account: "ST".to_string(),
-                            category: AccountCategory::Cash,
-                            symbol: curr.clone(),
-                            amount: amt,
-                            native_currency: curr,
-                            value_native: amt,
-                            value_chf: val_chf,
-                        });
+                    let should_poll = !matches!(last_starling_poll, Some(t) if t.elapsed() < starling_poll_interval);
+                    if should_poll {
+                        last_starling_poll = Some(Instant::now());
+                        if let Some(st_balances) = prov.fetch_starling_balances(tok).await {
+                            starling_poll_interval = Duration::from_secs(60);
+                            let fx = {
+                                let state = app.read().await;
+                                state.fx_rates
+                            };
+                            let mut st_items = Vec::new();
+                            for (curr, amt) in st_balances {
+                                let val_chf = fx.to_chf(&curr, amt);
+                                st_items.push(BalanceItem {
+                                    account: "ST".to_string(),
+                                    category: AccountCategory::Cash,
+                                    symbol: curr.clone(),
+                                    amount: amt,
+                                    native_currency: curr,
+                                    value_native: amt,
+                                    value_chf: val_chf,
+                                });
+                            }
+                            let mut state = app.write().await;
+                            state.update_account_balances("ST", st_items);
+                        } else {
+                            // Backoff on rate limit or error
+                            starling_poll_interval = Duration::from_secs(120);
+                        }
                     }
                 }
 
                 // Check Kraken balances
-                if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret) {
-                    let kraken_balances = prov.fetch_kraken_balances(key, secret).await;
-                    for (curr, amt) in kraken_balances {
-                        let (native_curr, val_native) = if curr == "USD" {
-                            ("USD".to_string(), amt)
-                        } else if curr == "CHF" {
-                            ("CHF".to_string(), amt)
-                        } else if curr == "EUR" {
-                            ("EUR".to_string(), amt)
-                        } else if curr == "GBP" {
-                            ("GBP".to_string(), amt)
-                        } else {
-                            let price = {
-                                let cached = {
-                                    let state = app.read().await;
-                                    state.get_crypto_price(&curr)
+                if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret)
+                    && let Some(kraken_balances) = prov.fetch_kraken_balances(key, secret).await {
+                        let mut kraken_items = Vec::new();
+                        for (curr, amt) in kraken_balances {
+                            let (native_curr, val_native) = if curr == "USD" {
+                                ("USD".to_string(), amt)
+                            } else if curr == "CHF" {
+                                ("CHF".to_string(), amt)
+                            } else if curr == "EUR" {
+                                ("EUR".to_string(), amt)
+                            } else if curr == "GBP" {
+                                ("GBP".to_string(), amt)
+                            } else {
+                                let price = {
+                                    let cached = {
+                                        let state = app.read().await;
+                                        state.get_crypto_price(&curr)
+                                    };
+                                    if let Some(p) = cached {
+                                        p
+                                    } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
+                                        let mut state = app.write().await;
+                                        state.set_crypto_price(&curr, p);
+                                        p
+                                    } else {
+                                        0.0
+                                    }
                                 };
-                                if let Some(p) = cached {
-                                    p
-                                } else if let Some(p) = prov.fetch_asset_price_usd(&curr).await {
-                                    let mut state = app.write().await;
-                                    state.set_crypto_price(&curr, p);
-                                    p
-                                } else {
-                                    0.0
-                                }
+                                ("USD".to_string(), amt * price)
                             };
-                            ("USD".to_string(), amt * price)
-                        };
-                        let val_chf = {
-                            let state = app.read().await;
-                            state.fx_rates.to_chf(&native_curr, val_native)
-                        };
-                        new_balances.push(BalanceItem {
-                            account: "Kraken".to_string(),
-                            category: AccountCategory::Crypto,
-                            symbol: curr,
-                            amount: amt,
-                            native_currency: native_curr,
-                            value_native: val_native,
-                            value_chf: val_chf,
-                        });
+                            let val_chf = {
+                                let state = app.read().await;
+                                state.fx_rates.to_chf(&native_curr, val_native)
+                            };
+                            kraken_items.push(BalanceItem {
+                                account: "Kraken".to_string(),
+                                category: AccountCategory::Crypto,
+                                symbol: curr,
+                                amount: amt,
+                                native_currency: native_curr,
+                                value_native: val_native,
+                                value_chf: val_chf,
+                            });
+                        }
+                        let mut state = app.write().await;
+                        state.update_account_balances("Kraken", kraken_items);
                     }
-                }
-
 
                 {
                     let mut state = app.write().await;
-                    state.balances = new_balances;
                     state.update_balance_values();
                 }
 
-
-                tokio::time::sleep(Duration::from_secs_f64(update_secs)).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
     }

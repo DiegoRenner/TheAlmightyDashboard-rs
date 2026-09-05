@@ -1,4 +1,5 @@
 use std::time::Instant;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct TickerItem {
@@ -36,7 +37,7 @@ impl TickerItem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountCategory {
     Crypto,
     Stocks,
@@ -84,7 +85,7 @@ impl FxRates {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BalanceItem {
     pub account: String,
     pub category: AccountCategory,
@@ -237,6 +238,56 @@ impl AppState {
         }
     }
 
+    pub fn update_account_balances(&mut self, account: &str, new_items: Vec<BalanceItem>) {
+        let mut updated = Vec::new();
+        let mut inserted = false;
+        for b in self.balances.drain(..) {
+            if b.account == account {
+                if !inserted {
+                    updated.extend(new_items.clone());
+                    inserted = true;
+                }
+            } else {
+                updated.push(b);
+            }
+        }
+        if !inserted {
+            updated.extend(new_items);
+        }
+        self.balances = updated;
+        self.update_balance_values();
+        self.save_balance_cache();
+    }
+
+    pub fn save_balance_cache(&self) {
+        if let Some(path) = balance_cache_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&self.balances) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
+    pub fn load_balance_cache(&mut self) {
+        if let Some(path) = balance_cache_path()
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(items) = serde_json::from_str::<Vec<BalanceItem>>(&json)
+            && !items.is_empty()
+        {
+            self.balances = items;
+            self.update_balance_values();
+        }
+    }
+}
+
+pub fn balance_cache_path() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("HOME") {
+        Some(std::path::PathBuf::from(home).join(".cache/the-almighty-dashboard/balances.json"))
+    } else {
+        Some(std::path::PathBuf::from(".balances_cache.json"))
+    }
 }
 
 pub fn normalize_crypto_symbol(sym: &str) -> String {
@@ -364,6 +415,50 @@ mod tests {
         println!("After ticker prices: XMR val_chf={}, ETH val_chf={}", state.balances[0].value_chf, state.balances[1].value_chf);
         assert!(state.balances[0].value_chf > 0.0);
         assert!(state.balances[1].value_chf > 0.0);
+    }
+
+    #[test]
+    fn test_update_account_balances_preserves_other_accounts() {
+        let mut state = AppState::new(vec![], vec![]);
+        state.update_account_balances("ST", vec![BalanceItem {
+            account: "ST".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "GBP".to_string(),
+            amount: 5.31,
+            native_currency: "GBP".to_string(),
+            value_native: 5.31,
+            value_chf: 5.31 * 1.09,
+        }]);
+        assert_eq!(state.balances.len(), 1);
+        assert_eq!(state.balances[0].account, "ST");
+
+        // Now update another account "UH":
+        state.update_account_balances("UH", vec![BalanceItem {
+            account: "UH".to_string(),
+            category: AccountCategory::Crypto,
+            symbol: "ETH".to_string(),
+            amount: 0.01,
+            native_currency: "USD".to_string(),
+            value_native: 25.0,
+            value_chf: 20.0,
+        }]);
+        assert_eq!(state.balances.len(), 2);
+        // ST should still be preserved:
+        assert!(state.balances.iter().any(|b| b.account == "ST" && b.amount == 5.31));
+
+        // Now update ST with new balance:
+        state.update_account_balances("ST", vec![BalanceItem {
+            account: "ST".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "GBP".to_string(),
+            amount: 10.0,
+            native_currency: "GBP".to_string(),
+            value_native: 10.0,
+            value_chf: 10.9,
+        }]);
+        assert_eq!(state.balances.len(), 2);
+        assert!(state.balances.iter().any(|b| b.account == "ST" && b.amount == 10.0));
+        assert!(state.balances.iter().any(|b| b.account == "UH" && b.amount == 0.01));
     }
 }
 
