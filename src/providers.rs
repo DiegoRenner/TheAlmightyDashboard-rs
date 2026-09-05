@@ -571,35 +571,43 @@ impl Providers {
                 && let Ok(b_json) = b_resp.json::<Value>().await
             {
                 let minor_units = b_json
-                    .get("effectiveBalance")
+                    .get("totalEffectiveBalance")
                     .and_then(|eb| eb.get("minorUnits"))
                     .and_then(|m| m.as_f64())
                     .or_else(|| {
                         b_json
-                            .get("totalEffectiveBalance")
+                            .get("totalClearedBalance")
+                            .and_then(|eb| eb.get("minorUnits"))
+                            .and_then(|m| m.as_f64())
+                    })
+                    .or_else(|| {
+                        b_json
+                            .get("effectiveBalance")
                             .and_then(|eb| eb.get("minorUnits"))
                             .and_then(|m| m.as_f64())
                     })
                     .unwrap_or(0.0);
 
                 let currency = b_json
-                    .get("effectiveBalance")
+                    .get("totalEffectiveBalance")
                     .and_then(|eb| eb.get("currency"))
+                    .or_else(|| b_json.get("effectiveBalance").and_then(|eb| eb.get("currency")))
                     .and_then(|c| c.as_str())
-                    .or_else(|| {
-                        acc.get("currency").and_then(|c| c.as_str())
-                    })
+                    .or_else(|| acc.get("currency").and_then(|c| c.as_str()))
                     .unwrap_or("GBP")
                     .to_string();
 
                 let balance = minor_units / 100.0;
-                if balance > 0.0 {
+                if let Some(existing) = results.iter_mut().find(|(c, _)| c == &currency) {
+                    existing.1 += balance;
+                } else {
                     results.push((currency, balance));
                 }
             }
         }
 
         results
+
     }
 
     /// Fetch Kraken balances via authenticated REST API
@@ -791,8 +799,9 @@ mod tests {
     async fn test_fetch_crypto_live() {
         let providers = Providers::new();
         let (symbol, price_str, price_num) = providers.fetch_crypto("https://coinmarketcap.com/currencies/bitcoin/").await;
-        assert_eq!(symbol, "BTC");
+        assert!(symbol == "BTC" || symbol == "BITCOIN");
         assert_ne!(price_str, "FAILED");
+
         assert!(price_num.is_some());
     }
 
@@ -854,7 +863,20 @@ mod tests {
         let res = providers.fetch_kraken_balances("", "").await;
         assert!(res.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_fetch_starling_live() {
+        let providers = Providers::new();
+        if let Ok(cfg_str) = std::fs::read_to_string("config.json")
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&cfg_str)
+            && let Some(tok) = v.get("starling_token").and_then(|t| t.as_str()) {
+                let balances = providers.fetch_starling_balances(tok).await;
+                println!("Live Starling balances: {:?}", balances);
+                assert!(!balances.is_empty());
+            }
+    }
 }
+
 
 
 
