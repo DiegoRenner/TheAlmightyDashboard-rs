@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.tickers[pos].price_num = price_num;
                             state.tickers[pos].last_success = Some(Instant::now());
                         }
+                        state.update_balance_values();
                     }
                 }
                 tokio::time::sleep(Duration::from_secs_f64(update_secs)).await;
@@ -118,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Check Monero balances
                 for addr in &monero_addrs {
-                    if let Some(amt) = prov.fetch_monero_balance(addr).await {
-                        if amt > 0.0 {
+                    if let Some(amt) = prov.fetch_monero_balance(addr).await
+                        && amt > 0.0 {
                             let xmr_price = {
                                 let state = app.read().await;
                                 state.get_crypto_price("XMR").unwrap_or(0.0)
@@ -130,7 +131,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 value_usd: amt * xmr_price,
                             });
                         }
-                    }
                 }
 
                 // Check Uphold balances
@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let mut state = app.write().await;
                     state.balances = new_balances;
+                    state.update_balance_values();
                 }
 
                 tokio::time::sleep(Duration::from_secs_f64(update_secs)).await;
@@ -195,8 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Handle keyboard input (non-blocking poll)
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()? {
                 let mut state = app_state.write().await;
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -212,7 +213,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => {}
                 }
             }
-        }
     }
 
     // Restore terminal cleanly
