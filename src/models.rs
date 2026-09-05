@@ -260,6 +260,9 @@ impl AppState {
     }
 
     pub fn save_balance_cache(&self) {
+        if self.balances.is_empty() {
+            return;
+        }
         if let Some(path) = balance_cache_path() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -283,10 +286,20 @@ impl AppState {
 }
 
 pub fn balance_cache_path() -> Option<std::path::PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        Some(std::path::PathBuf::from(home).join(".cache/the-almighty-dashboard/balances.json"))
-    } else {
-        Some(std::path::PathBuf::from(".balances_cache.json"))
+    #[cfg(test)]
+    {
+        None
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(path) = std::env::var("DASHBOARD_CACHE_FILE") {
+            return Some(std::path::PathBuf::from(path));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            Some(std::path::PathBuf::from(home).join(".cache/the-almighty-dashboard/balances.json"))
+        } else {
+            Some(std::path::PathBuf::from(".balances_cache.json"))
+        }
     }
 }
 
