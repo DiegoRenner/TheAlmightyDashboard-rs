@@ -374,37 +374,45 @@ impl Providers {
             Err(_) => return None,
         };
 
-        let signing_key = match SigningKey::try_from(raw_bytes.as_slice()) {
-            Ok(k) => k,
-            Err(_) => return None,
+        let seed: [u8; 32] = if raw_bytes.len() >= 32 {
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&raw_bytes[..32]);
+            s
+        } else {
+            return None;
         };
 
-        // 2. Build JWT header and payload
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let signing_key = SigningKey::from_bytes(&seed);
+
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return None,
+        };
+        let exp = now + 120;
+        let nonce = format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
+
         let header = serde_json::json!({
             "alg": "EdDSA",
-            "typ": "JWT",
-            "kid": api_key.trim(),
-            "nonce": format!("{now}")
+            "kid": api_key,
+            "nonce": nonce,
+            "typ": "JWT"
         });
 
-        let uri = "GET api.coinbase.com/api/v3/brokerage/accounts";
         let payload = serde_json::json!({
-            "sub": api_key.trim(),
-            "iss": "cdp",
+            "iss": "coinbase-cloud",
+            "sub": api_key,
             "nbf": now,
-            "exp": now + 120,
-            "uri": uri
+            "exp": exp,
+            "uri": "GET api.coinbase.com/api/v3/brokerage/accounts"
         });
 
-        let b64_header = BASE64_URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
-        let b64_payload = BASE64_URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-        let unsigned_token = format!("{b64_header}.{b64_payload}");
+        let header_b64 = BASE64_URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+        let payload_b64 = BASE64_URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-        // 3. Sign using Ed25519
-        let signature = signing_key.sign(unsigned_token.as_bytes());
-        let b64_signature = BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes());
-        let jwt_token = format!("{unsigned_token}.{b64_signature}");
+        let signature = signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes());
+        let jwt_token = format!("{}.{}", signing_input, sig_b64);
 
         let resp = match self
             .client
