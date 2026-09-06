@@ -727,7 +727,7 @@ impl Providers {
         }
 
         let send_url = format!(
-            "https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest?t={}&q={}&v=3",
+            "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest?t={}&q={}&v=3",
             token.trim(),
             query_id.trim()
         );
@@ -740,7 +740,7 @@ impl Providers {
         let ref_code = parse_ibkr_send_request_xml(&send_xml).ok()?;
 
         let get_url = format!(
-            "https://ndcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement?q={}&t={}&v=3",
+            "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement?q={}&t={}&v=3",
             ref_code.trim(),
             token.trim()
         );
