@@ -267,7 +267,7 @@ impl AppState {
     }
 
     pub fn is_session_dependent(account: &str) -> bool {
-        matches!(account, "UH" | "FP" | "SQ" | "REV")
+        matches!(account, "UH" | "FP" | "SQ" | "REV" | "UBS")
     }
 
     pub fn update_account_balances(&mut self, account: &str, new_items: Vec<BalanceItem>) {
@@ -519,6 +519,7 @@ mod tests {
         assert!(AppState::is_session_dependent("FP"));
         assert!(AppState::is_session_dependent("SQ"));
         assert!(AppState::is_session_dependent("REV"));
+        assert!(AppState::is_session_dependent("UBS"));
         assert!(!AppState::is_session_dependent("CB"));
         assert!(!AppState::is_session_dependent("IB"));
         assert!(!AppState::is_session_dependent("ST"));

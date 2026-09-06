@@ -152,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut swissquote_poll_interval = Duration::from_secs(60);
             let mut last_revolut_poll: Option<Instant> = None;
             let mut revolut_poll_interval = Duration::from_secs(60);
+            let mut last_ubs_poll: Option<Instant> = None;
+            let mut ubs_poll_interval = Duration::from_secs(60);
 
             loop {
                 // Check Monero balances (MW)
@@ -555,6 +557,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.mark_account_stale("REV");
                         }
                         revolut_poll_interval = Duration::from_secs(60);
+                    }
+                }
+
+                // Check UBS balances (UBS)
+                let should_poll = !matches!(last_ubs_poll, Some(t) if t.elapsed() < ubs_poll_interval);
+                if should_poll {
+                    last_ubs_poll = Some(Instant::now());
+                    let fx = {
+                        let state = app.read().await;
+                        state.fx_rates
+                    };
+                    if let Some(ubs_items) = prov.fetch_ubs_balances(&fx).await {
+                        ubs_poll_interval = Duration::from_secs(120);
+                        let mut state = app.write().await;
+                        state.update_account_balances("UBS", ubs_items);
+                    } else {
+                        let has_ubs = {
+                            let state = app.read().await;
+                            state.balances.iter().any(|b| b.account == "UBS")
+                        };
+                        if has_ubs {
+                            let mut state = app.write().await;
+                            state.mark_account_stale("UBS");
+                        }
+                        ubs_poll_interval = Duration::from_secs(60);
                     }
                 }
 

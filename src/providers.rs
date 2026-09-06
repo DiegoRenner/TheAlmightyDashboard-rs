@@ -1286,6 +1286,170 @@ impl Providers {
 
         None
     }
+
+    /// Fetch live UBS balances (Privatkonto, Sparkonto, Prepaid Cards, Net Assets) from an active browser session via Chrome DevTools Protocol (CDP)
+    pub async fn fetch_ubs_balances(&self, fx: &crate::models::FxRates) -> Option<Vec<BalanceItem>> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let targets_resp = self
+            .client
+            .get("http://127.0.0.1:9222/json")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        let targets: Value = targets_resp.json().await.ok()?;
+        let targets_arr = targets.as_array()?;
+
+        let mut ws_url = None;
+        for t in targets_arr {
+            let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let ty = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
+            if ty == "page"
+                && url.contains("ebanking-ch")
+                && !url.contains("login")
+                && !url.contains("logout")
+                && let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|w| w.as_str())
+            {
+                ws_url = Some(ws.to_string());
+                break;
+            }
+        }
+
+        let ws_url = ws_url?;
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
+
+        let extract_js = r#"
+        (() => {
+            const bodyText = document.body ? document.body.innerText : "";
+            if (!bodyText.includes("E-Banking") || (!bodyText.includes("Total net assets") && !bodyText.includes("Privatkonto"))) {
+                return JSON.stringify({ status: "not_logged_in" });
+            }
+
+            const articles = Array.from(document.querySelectorAll("article, [class*='Panel_container']"));
+            const accounts = [];
+
+            for (const art of articles) {
+                const text = art.innerText || "";
+                const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+                
+                if (lines.length >= 3) {
+                    const name = lines[0];
+                    let amt = null;
+                    let curr = "CHF";
+
+                    for (const line of lines) {
+                        const m = line.match(/(CHF|EUR|USD|GBP)\s*([\d\x27\.,]+)/i) || line.match(/([\d\x27\.,]+)\s*(CHF|EUR|USD|GBP)/i);
+                        if (m) {
+                            curr = (m[1] && isNaN(parseFloat(m[1]))) ? m[1].toUpperCase() : (m[2] ? m[2].toUpperCase() : "CHF");
+                            const rawNum = isNaN(parseFloat(m[1])) ? m[2] : m[1];
+                            const parsed = parseFloat(rawNum.replace(/'/g, "").replace(/,/g, ""));
+                            if (!isNaN(parsed)) {
+                                amt = parsed;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (name && amt !== null) {
+                        accounts.push({
+                            name: name,
+                            currency: curr,
+                            amount: amt
+                        });
+                    }
+                }
+            }
+
+            const totalMatch = bodyText.match(/Total net assets[\s\S]*?(CHF|EUR|USD|GBP)\s*([\d\x27\.,]+)/i);
+            const totalNetAssets = totalMatch ? parseFloat(totalMatch[2].replace(/'/g, "").replace(/,/g, "")) : null;
+
+            return JSON.stringify({
+                status: "logged_in",
+                accounts: accounts,
+                totalNetAssets: totalNetAssets
+            });
+        })()
+        "#;
+
+        let eval_msg = serde_json::json!({
+            "id": 2,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": extract_js,
+                "returnByValue": true
+            }
+        }).to_string();
+
+        let _ = ws_stream.send(Message::Text(eval_msg.into())).await;
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            let msg = match tokio::time::timeout(Duration::from_millis(1500), ws_stream.next()).await {
+                Ok(Some(Ok(Message::Text(txt)))) => txt,
+                _ => break,
+            };
+
+            if let Ok(val) = serde_json::from_str::<Value>(&msg)
+                && val.get("id") == Some(&serde_json::json!(2))
+            {
+                if let Some(val_str) = val.pointer("/result/result/value").and_then(|v| v.as_str()) {
+                    return parse_ubs_json(val_str, fx);
+                }
+                break;
+            }
+        }
+
+        None
+    }
+}
+
+pub fn parse_ubs_json(json_str: &str, fx: &crate::models::FxRates) -> Option<Vec<BalanceItem>> {
+    let res = serde_json::from_str::<Value>(json_str).ok()?;
+    if res.get("status").and_then(|s| s.as_str()) != Some("logged_in") {
+        return None;
+    }
+    let mut items = Vec::new();
+    if let Some(accs) = res.get("accounts").and_then(|a| a.as_array()) {
+        for acc in accs {
+            let raw_name = acc.get("name").and_then(|n| n.as_str()).unwrap_or("UBS Account");
+            let sym = raw_name.replace("UBS ", "").trim().to_string();
+            let curr = acc.get("currency").and_then(|c| c.as_str()).unwrap_or("CHF").to_string();
+            if let Some(amt) = acc.get("amount").and_then(|a| a.as_f64()) {
+                let val_chf = fx.to_chf(&curr, amt);
+                items.push(BalanceItem {
+                    account: "UBS".to_string(),
+                    category: crate::models::AccountCategory::Cash,
+                    symbol: sym,
+                    amount: amt,
+                    native_currency: curr,
+                    value_native: amt,
+                    value_chf: (val_chf * 100.0).round() / 100.0,
+                });
+            }
+        }
+    }
+
+    if items.is_empty()
+        && let Some(total) = res.get("totalNetAssets").and_then(|t| t.as_f64())
+    {
+        items.push(BalanceItem {
+            account: "UBS".to_string(),
+            category: crate::models::AccountCategory::Cash,
+            symbol: "Net Assets".to_string(),
+            amount: total,
+            native_currency: "CHF".to_string(),
+            value_native: total,
+            value_chf: total,
+        });
+    }
+
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
 }
 
 pub fn parse_revolut_json(json_str: &str, fx: &crate::models::FxRates) -> Option<Vec<BalanceItem>> {
@@ -2008,6 +2172,73 @@ mod tests {
             assert!(!items.is_empty());
         } else {
             println!("No active Revolut tab or not logged in; safely handled as None");
+        }
+    }
+
+    #[test]
+    fn test_parse_ubs_json_valid() {
+        let fx = crate::models::FxRates::default();
+        let sample = r#"{
+            "status": "logged_in",
+            "accounts": [
+                { "name": "UBS Privatkonto", "currency": "CHF", "amount": 210.50 },
+                { "name": "UBS Sparkonto", "currency": "CHF", "amount": 77.25 },
+                { "name": "UBS Mastercard Prepaid", "currency": "CHF", "amount": 42.10 }
+            ],
+            "totalNetAssets": 329.85
+        }"#;
+        let parsed = parse_ubs_json(sample, &fx);
+        assert!(parsed.is_some());
+        let items = parsed.unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].account, "UBS");
+        assert_eq!(items[0].category, crate::models::AccountCategory::Cash);
+        assert_eq!(items[0].symbol, "Privatkonto");
+        assert_eq!(items[0].amount, 210.50);
+        assert_eq!(items[0].value_chf, 210.50);
+
+        assert_eq!(items[1].symbol, "Sparkonto");
+        assert_eq!(items[1].amount, 77.25);
+
+        assert_eq!(items[2].symbol, "Mastercard Prepaid");
+        assert_eq!(items[2].amount, 42.10);
+    }
+
+    #[test]
+    fn test_parse_ubs_json_fallback_total() {
+        let fx = crate::models::FxRates::default();
+        let sample = r#"{
+            "status": "logged_in",
+            "accounts": [],
+            "totalNetAssets": 329.85
+        }"#;
+        let parsed = parse_ubs_json(sample, &fx);
+        assert!(parsed.is_some());
+        let items = parsed.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].account, "UBS");
+        assert_eq!(items[0].symbol, "Net Assets");
+        assert_eq!(items[0].amount, 329.85);
+        assert_eq!(items[0].value_chf, 329.85);
+    }
+
+    #[test]
+    fn test_parse_ubs_json_not_logged_in_or_empty() {
+        let fx = crate::models::FxRates::default();
+        assert!(parse_ubs_json(r#"{"status": "not_logged_in"}"#, &fx).is_none());
+        assert!(parse_ubs_json(r#"{"status": "logged_in", "accounts": []}"#, &fx).is_none());
+        assert!(parse_ubs_json("invalid json", &fx).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_ubs_live() {
+        let providers = Providers::new();
+        let fx = crate::models::FxRates::default();
+        if let Some(items) = providers.fetch_ubs_balances(&fx).await {
+            println!("Fetched UBS live items: {}", items.len());
+            assert!(!items.is_empty());
+        } else {
+            println!("No active UBS tab or not logged in; safely handled as None");
         }
     }
 }
