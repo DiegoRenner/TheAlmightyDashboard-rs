@@ -96,12 +96,19 @@ pub struct BalanceItem {
     pub value_chf: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncStatus {
+    Live,
+    Stale,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub tickers: Vec<TickerItem>,
     pub balances: Vec<BalanceItem>,
     pub fx_rates: FxRates,
     pub price_cache: std::collections::HashMap<String, f64>,
+    pub account_sync: std::collections::HashMap<String, SyncStatus>,
     pub scroll_offset: usize,
     pub should_quit: bool,
 }
@@ -122,6 +129,7 @@ impl AppState {
             balances: Vec::new(),
             fx_rates: FxRates::default(),
             price_cache: std::collections::HashMap::new(),
+            account_sync: std::collections::HashMap::new(),
             scroll_offset: 0,
             should_quit: false,
         }
@@ -240,7 +248,25 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn mark_account_live(&mut self, account: &str) {
+        self.account_sync.insert(account.to_string(), SyncStatus::Live);
+    }
+
+    pub fn mark_account_stale(&mut self, account: &str) {
+        self.account_sync.insert(account.to_string(), SyncStatus::Stale);
+    }
+
+    pub fn is_account_stale(&self, account: &str) -> bool {
+        matches!(self.account_sync.get(account), Some(SyncStatus::Stale))
+    }
+
+    pub fn is_session_dependent(account: &str) -> bool {
+        matches!(account, "UH" | "FP")
+    }
+
     pub fn update_account_balances(&mut self, account: &str, new_items: Vec<BalanceItem>) {
+        self.account_sync.insert(account.to_string(), SyncStatus::Live);
         let mut updated = Vec::new();
         let mut inserted = false;
         for b in self.balances.drain(..) {
@@ -282,6 +308,9 @@ impl AppState {
             && !items.is_empty()
         {
             self.balances = items;
+            for b in &self.balances {
+                self.account_sync.entry(b.account.clone()).or_insert(SyncStatus::Stale);
+            }
             self.update_balance_values();
         }
     }
@@ -474,6 +503,41 @@ mod tests {
         assert_eq!(state.balances.len(), 2);
         assert!(state.balances.iter().any(|b| b.account == "ST" && b.amount == 10.0));
         assert!(state.balances.iter().any(|b| b.account == "UH" && b.amount == 0.01));
+    }
+
+    #[test]
+    fn test_sync_status_live_and_stale() {
+        let mut state = AppState::new(vec![], vec![]);
+        assert!(AppState::is_session_dependent("UH"));
+        assert!(AppState::is_session_dependent("FP"));
+        assert!(!AppState::is_session_dependent("CB"));
+        assert!(!AppState::is_session_dependent("IB"));
+        assert!(!AppState::is_session_dependent("ST"));
+        assert!(!AppState::is_session_dependent("MW"));
+        assert!(!AppState::is_session_dependent("CW"));
+        assert!(!AppState::is_session_dependent("Kraken"));
+
+        assert!(!state.is_account_stale("UH"));
+        state.mark_account_stale("UH");
+        assert!(state.is_account_stale("UH"));
+
+        // update_account_balances marks live
+        state.update_account_balances("UH", vec![BalanceItem {
+            account: "UH".to_string(),
+            category: AccountCategory::Crypto,
+            symbol: "BAT".to_string(),
+            amount: 100.0,
+            native_currency: "USD".to_string(),
+            value_native: 20.0,
+            value_chf: 16.0,
+        }]);
+        assert!(!state.is_account_stale("UH"));
+        assert_eq!(state.account_sync.get("UH"), Some(&SyncStatus::Live));
+
+        state.mark_account_stale("UH");
+        assert!(state.is_account_stale("UH"));
+        state.mark_account_live("UH");
+        assert!(!state.is_account_stale("UH"));
     }
 }
 

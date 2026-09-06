@@ -230,8 +230,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                 // Check Uphold balances (UH)
-                if let Some(ref tok) = uphold_tok
-                    && let Some(cards) = prov.fetch_uphold_cards(tok).await {
+                let has_uh = uphold_tok.is_some() || {
+                    let state = app.read().await;
+                    state.balances.iter().any(|b| b.account == "UH")
+                };
+                if has_uh {
+                    let tok_str = uphold_tok.as_deref().unwrap_or("");
+                    if let Some(cards) = prov.fetch_uphold_cards(tok_str).await {
                         let mut uh_items = Vec::new();
                         for (curr, amt) in cards {
                             let (native_curr, val_native) = if curr == "USD" {
@@ -276,11 +281,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let mut state = app.write().await;
                         state.update_account_balances("UH", uh_items);
+                    } else {
+                        let mut state = app.write().await;
+                        state.mark_account_stale("UH");
                     }
+                }
 
                 // Check Coinbase balances (CB)
-                if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret)
-                    && let Some(cb_balances) = prov.fetch_coinbase_balances(key, secret).await {
+                if let (Some(key), Some(secret)) = (&coinbase_key, &coinbase_secret) {
+                    if let Some(cb_balances) = prov.fetch_coinbase_balances(key, secret).await {
                         let mut cb_items = Vec::new();
                         for (curr, amt, _) in cb_balances {
                             let (native_curr, val_native) = if curr == "USD" || curr == "USDC" {
@@ -319,7 +328,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let mut state = app.write().await;
                         state.update_account_balances("CB", cb_items);
+                    } else {
+                        let mut state = app.write().await;
+                        state.mark_account_stale("CB");
                     }
+                }
 
                 // Check Starling Bank balances (ST)
                 if let Some(ref tok) = starling_tok {
@@ -349,14 +362,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.update_account_balances("ST", st_items);
                         } else {
                             // Backoff on rate limit or error
+                            let mut state = app.write().await;
+                            state.mark_account_stale("ST");
                             starling_poll_interval = Duration::from_secs(120);
                         }
                     }
                 }
 
                 // Check Kraken balances
-                if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret)
-                    && let Some(kraken_balances) = prov.fetch_kraken_balances(key, secret).await {
+                if let (Some(key), Some(secret)) = (&kraken_key, &kraken_secret) {
+                    if let Some(kraken_balances) = prov.fetch_kraken_balances(key, secret).await {
                         let mut kraken_items = Vec::new();
                         for (curr, amt) in kraken_balances {
                             let (native_curr, val_native) = if curr == "USD" {
@@ -401,7 +416,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let mut state = app.write().await;
                         state.update_account_balances("Kraken", kraken_items);
+                    } else {
+                        let mut state = app.write().await;
+                        state.mark_account_stale("Kraken");
                     }
+                }
 
                 // Check Interactive Brokers balances (IB)
                 if let (Some(tok), Some(qid)) = (&ibkr_tok, &ibkr_qid) {
@@ -431,6 +450,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.update_account_balances("IB", ib_items);
                         } else {
                             // Backoff on rate limit or error
+                            let mut state = app.write().await;
+                            state.mark_account_stale("IB");
                             ibkr_poll_interval = Duration::from_secs(120);
                         }
                     }
@@ -461,6 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.update_account_balances("FP", fp_items);
                     } else {
                         // Backoff on rate limit, expired token, or no tab open
+                        let mut state = app.write().await;
+                        state.mark_account_stale("FP");
                         finpension_poll_interval = Duration::from_secs(120);
                     }
                 }

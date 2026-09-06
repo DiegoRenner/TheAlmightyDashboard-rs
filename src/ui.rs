@@ -163,9 +163,26 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
                 AccountCategory::Retirement => Style::default().fg(Color::Green),
             };
 
+            let is_session = AppState::is_session_dependent(&item.account);
+            let is_stale = app.is_account_stale(&item.account);
+
+            let acc_label = if is_session {
+                format!("{}*", item.account)
+            } else {
+                item.account.clone()
+            };
+
+            let acc_style = if is_stale {
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+            } else if is_session {
+                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            };
+
             Row::new(vec![
                 Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(item.account.clone()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Cell::from(acc_label).style(acc_style),
                 Cell::from(item.category.to_string()).style(cat_style),
                 Cell::from(item.symbol.clone()).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Cell::from(format_balance_amount(item.amount)).style(Style::default().fg(Color::White)),
@@ -178,7 +195,7 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
         rows,
         [
             Constraint::Length(3),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(14),
@@ -189,7 +206,7 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Holdings & Accounts ", Style::default().add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" Holdings & Accounts (*=Session · Red=Stale) ", Style::default().add_modifier(Modifier::BOLD))),
     );
 
     f.render_widget(table, area);
@@ -204,6 +221,23 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
     let total_net_worth = app.total_net_worth_chf();
     let total_usd = app.total_balance_usd();
 
+    let is_fp_stale = app.is_account_stale("FP");
+    let mut ret_spans = vec![
+        Span::styled(
+            " Retirement:    ",
+            Style::default()
+                .fg(if is_fp_stale { Color::LightRed } else { Color::Green })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("CHF {}", format_chf(ret_val)),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if is_fp_stale {
+        ret_spans.push(Span::styled(" (stale session)", Style::default().fg(Color::LightRed)));
+    }
+
     let summary_lines = vec![
         Line::from(vec![
             Span::styled(" Stocks & Cash: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -214,10 +248,7 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
             Span::styled(" Crypto:        ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
             Span::styled(format!("CHF {}", format_chf(crypto_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![
-            Span::styled(" Retirement:    ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("CHF {}", format_chf(ret_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(ret_spans),
         Line::from(vec![
             Span::styled(" Total (CHF):   ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("CHF {} ", format_chf(total_net_worth)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
@@ -281,6 +312,34 @@ mod tests {
         assert_eq!(format_balance_amount(0.0), "0.00");
         assert_eq!(format_balance_amount(7.654321), "7.6543");
         assert_eq!(format_balance_amount(0.00005432), "0.00005432");
+    }
+
+    #[test]
+    fn test_render_with_session_and_stale_accounts() {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = AppState::new(vec![], vec![]);
+        app.balances.push(crate::models::BalanceItem {
+            account: "UH".to_string(),
+            category: AccountCategory::Crypto,
+            symbol: "BAT".to_string(),
+            amount: 100.0,
+            native_currency: "USD".to_string(),
+            value_native: 20.0,
+            value_chf: 16.0,
+        });
+        app.balances.push(crate::models::BalanceItem {
+            account: "FP".to_string(),
+            category: AccountCategory::Retirement,
+            symbol: "finpension Equity 100".to_string(),
+            amount: 3000.0,
+            native_currency: "CHF".to_string(),
+            value_native: 3000.0,
+            value_chf: 3000.0,
+        });
+        app.mark_account_stale("FP");
+
+        terminal.draw(|f| render(f, &app)).unwrap();
     }
 }
 
