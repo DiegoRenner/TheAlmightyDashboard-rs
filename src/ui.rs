@@ -206,7 +206,7 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Holdings & Accounts (*=Session · Red=Stale) ", Style::default().add_modifier(Modifier::BOLD))),
+            .title(Span::styled(" Holdings & Accounts (*=Session Feed · Yellow=API/Daemon · Cyan=Live Session · Red=Stale) ", Style::default().add_modifier(Modifier::BOLD))),
     );
 
     f.render_widget(table, area);
