@@ -149,6 +149,32 @@ pub enum SyncStatus {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PrivacyMode {
+    #[default]
+    Normal,
+    HideAmounts,
+    HideAll,
+}
+
+impl PrivacyMode {
+    pub fn next(self) -> Self {
+        match self {
+            PrivacyMode::Normal => PrivacyMode::HideAmounts,
+            PrivacyMode::HideAmounts => PrivacyMode::HideAll,
+            PrivacyMode::HideAll => PrivacyMode::Normal,
+        }
+    }
+
+    pub fn hides_amounts(&self) -> bool {
+        matches!(self, PrivacyMode::HideAmounts | PrivacyMode::HideAll)
+    }
+
+    pub fn hides_quantities(&self) -> bool {
+        matches!(self, PrivacyMode::HideAll)
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub tickers: Vec<TickerItem>,
@@ -159,6 +185,7 @@ pub struct AppState {
     pub account_last_gathered: std::collections::HashMap<String, std::time::SystemTime>,
     pub scroll_offset: usize,
     pub should_quit: bool,
+    pub privacy_mode: PrivacyMode,
 }
 
 impl AppState {
@@ -181,6 +208,7 @@ impl AppState {
             account_last_gathered: std::collections::HashMap::new(),
             scroll_offset: 0,
             should_quit: false,
+            privacy_mode: PrivacyMode::Normal,
         }
     }
 
@@ -243,6 +271,10 @@ impl AppState {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
         }
+    }
+
+    pub fn cycle_privacy_mode(&mut self) {
+        self.privacy_mode = self.privacy_mode.next();
     }
 
     pub fn get_crypto_price(&self, symbol: &str) -> Option<f64> {
@@ -808,6 +840,32 @@ mod tests {
         assert_eq!(oldest.name, "BTC-USD");
         assert!(oldest.is_quote);
         assert!(oldest.elapsed_secs >= 900);
+    }
+
+    #[test]
+    fn test_privacy_mode_cycle() {
+        let mut state = AppState::new(vec![], vec![]);
+        assert_eq!(state.privacy_mode, PrivacyMode::Normal);
+        assert!(!state.privacy_mode.hides_amounts());
+        assert!(!state.privacy_mode.hides_quantities());
+
+        // First press: hides money amounts
+        state.cycle_privacy_mode();
+        assert_eq!(state.privacy_mode, PrivacyMode::HideAmounts);
+        assert!(state.privacy_mode.hides_amounts());
+        assert!(!state.privacy_mode.hides_quantities());
+
+        // Second press: hides quantity as well
+        state.cycle_privacy_mode();
+        assert_eq!(state.privacy_mode, PrivacyMode::HideAll);
+        assert!(state.privacy_mode.hides_amounts());
+        assert!(state.privacy_mode.hides_quantities());
+
+        // Third press: cycles back to normal
+        state.cycle_privacy_mode();
+        assert_eq!(state.privacy_mode, PrivacyMode::Normal);
+        assert!(!state.privacy_mode.hides_amounts());
+        assert!(!state.privacy_mode.hides_quantities());
     }
 }
 

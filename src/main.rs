@@ -634,6 +634,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('k') | KeyCode::Up => {
                         state.scroll_up();
                     }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        state.cycle_privacy_mode();
+                    }
                     _ => {}
                 }
             }

@@ -1,4 +1,4 @@
-use crate::models::{AccountCategory, AppState};
+use crate::models::{AccountCategory, AppState, PrivacyMode};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -47,6 +47,12 @@ pub fn render(f: &mut Frame, app: &AppState) {
         ]));
     }
 
+    let (privacy_desc, privacy_style) = match app.privacy_mode {
+        PrivacyMode::Normal => (" Privacy  ", Style::default().fg(Color::White)),
+        PrivacyMode::HideAmounts => (" Privacy:No$  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        PrivacyMode::HideAll => (" Privacy:No$+Qty  ", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)),
+    };
+
     let help_line = Line::from(vec![
         Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" Quit  "),
@@ -54,6 +60,8 @@ pub fn render(f: &mut Frame, app: &AppState) {
         Span::raw(" Down  "),
         Span::styled("[k/↑]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" Up  "),
+        Span::styled("[p]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(privacy_desc, privacy_style),
         Span::styled(
             format!("(Offset: {}) ", app.scroll_offset),
             Style::default().fg(Color::DarkGray),
@@ -193,16 +201,50 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             };
 
+            let amount_str = if app.privacy_mode.hides_quantities() {
+                "******".to_string()
+            } else {
+                format_balance_amount(item.amount)
+            };
+
+            let val_str = if app.privacy_mode.hides_amounts() {
+                "******".to_string()
+            } else {
+                format_chf(item.value_chf)
+            };
+
             Row::new(vec![
                 Cell::from(format!("{}", idx + 1)).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(acc_label).style(acc_style),
                 Cell::from(item.category.to_string()).style(cat_style),
                 Cell::from(item.symbol.clone()).style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Cell::from(format_balance_amount(item.amount)).style(Style::default().fg(Color::White)),
-                Cell::from(format_chf(item.value_chf)).style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Cell::from(amount_str).style(Style::default().fg(Color::White)),
+                Cell::from(val_str).style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ])
         })
         .collect();
+
+    let mut table_title_spans = vec![
+        Span::styled(" Holdings & Accounts ", Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    match app.privacy_mode {
+        PrivacyMode::Normal => {}
+        PrivacyMode::HideAmounts => {
+            table_title_spans.push(Span::styled("[🔒 Amounts Hidden] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        }
+        PrivacyMode::HideAll => {
+            table_title_spans.push(Span::styled("[🔒 Amounts & Qty Hidden] ", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)));
+        }
+    }
+    table_title_spans.extend(vec![
+        Span::styled("(", Style::default().fg(Color::DarkGray)),
+        Span::styled("● API", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("●* Session", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("● Stale", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+        Span::styled(") ", Style::default().fg(Color::DarkGray)),
+    ]);
 
     let table = Table::new(
         rows,
@@ -219,16 +261,7 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Line::from(vec![
-                Span::styled(" Holdings & Accounts ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled("(", Style::default().fg(Color::DarkGray)),
-                Span::styled("● API", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled("●* Session", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled("● Stale", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
-                Span::styled(") ", Style::default().fg(Color::DarkGray)),
-            ]))
+            .title(Line::from(table_title_spans))
             .title_bottom(Line::from(vec![
                 Span::styled(" Categories: ", Style::default().fg(Color::DarkGray)),
                 Span::styled("● Stocks", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
@@ -254,6 +287,15 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
     let total_net_worth = app.total_net_worth_chf();
     let total_usd = app.total_balance_usd();
 
+    let hide_money = app.privacy_mode.hides_amounts();
+    let format_val = |v: f64| -> String {
+        if hide_money {
+            "******".to_string()
+        } else {
+            format_chf(v)
+        }
+    };
+
     let is_fp_stale = app.is_account_stale("FP");
     let mut ret_spans = vec![
         Span::styled(
@@ -263,7 +305,7 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("CHF {}", format_chf(ret_val)),
+            format!("CHF {}", format_val(ret_val)),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -274,18 +316,18 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
     let mut summary_lines = vec![
         Line::from(vec![
             Span::styled(" Stocks & Cash: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("CHF {} ", format_chf(stocks_cash_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("(Stocks: {} / Cash: {})", format_chf(stocks_val), format_chf(cash_val)), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("CHF {} ", format_val(stocks_cash_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("(Stocks: {} / Cash: {})", format_val(stocks_val), format_val(cash_val)), Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled(" Crypto:        ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("CHF {}", format_chf(crypto_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("CHF {}", format_val(crypto_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(ret_spans),
         Line::from(vec![
             Span::styled(" Total (CHF):   ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("CHF {} ", format_chf(total_net_worth)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("(~${} USD)", format_chf(total_usd)), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("CHF {} ", format_val(total_net_worth)), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("(~${} USD)", format_val(total_usd)), Style::default().fg(Color::DarkGray)),
         ]),
     ];
 
@@ -302,11 +344,24 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
         ]));
     }
 
+    let mut summary_title_spans = vec![
+        Span::styled(" Portfolio Ledger Summary ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ];
+    match app.privacy_mode {
+        PrivacyMode::Normal => {}
+        PrivacyMode::HideAmounts => {
+            summary_title_spans.push(Span::styled("[🔒 Amounts Hidden] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        }
+        PrivacyMode::HideAll => {
+            summary_title_spans.push(Span::styled("[🔒 Amounts & Qty Hidden] ", Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)));
+        }
+    }
+
     let summary_widget = Paragraph::new(summary_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(Span::styled(" Portfolio Ledger Summary ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+            .title(Line::from(summary_title_spans)),
     );
 
     f.render_widget(summary_widget, area);
@@ -410,6 +465,52 @@ mod tests {
 
         // Render should succeed and include outdated field
         terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn test_render_privacy_mode_hide_amounts() {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = AppState::new(vec![], vec![]);
+        app.balances.push(crate::models::BalanceItem {
+            account: "UBS".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "CHF".to_string(),
+            amount: 250.0,
+            native_currency: "CHF".to_string(),
+            value_native: 250.0,
+            value_chf: 250.0,
+        });
+        app.privacy_mode = PrivacyMode::HideAmounts;
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("******"));
+        assert!(content.contains("250.00"));
+    }
+
+    #[test]
+    fn test_render_privacy_mode_hide_all() {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = AppState::new(vec![], vec![]);
+        app.balances.push(crate::models::BalanceItem {
+            account: "UBS".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "CHF".to_string(),
+            amount: 250.0,
+            native_currency: "CHF".to_string(),
+            value_native: 250.0,
+            value_chf: 250.0,
+        });
+        app.privacy_mode = PrivacyMode::HideAll;
+
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("******"));
+        assert!(!content.contains("250.00"));
     }
 }
 
