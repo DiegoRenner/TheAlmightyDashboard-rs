@@ -424,12 +424,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Check Interactive Brokers balances (IB)
                 if let Ok(fresh_cfg) = crate::config::Config::load_or_default::<&str>(None) {
+                    let mut config_changed = false;
                     if fresh_cfg.ibkr_flex_token != ibkr_tok {
                         ibkr_tok = fresh_cfg.ibkr_flex_token;
-                        last_ibkr_poll = None;
+                        config_changed = true;
                     }
                     if fresh_cfg.ibkr_query_id != ibkr_qid {
                         ibkr_qid = fresh_cfg.ibkr_query_id;
+                        config_changed = true;
+                    }
+                    if config_changed {
+                        ibkr_poll_interval = Duration::from_secs(600);
                         last_ibkr_poll = None;
                     }
                 }
@@ -460,10 +465,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut state = app.write().await;
                             state.update_account_balances("IB", ib_items);
                         } else {
-                            // Backoff on rate limit or error (15 minutes to allow IBKR lockout to clear)
+                            // Exponential backoff on error: 15m -> 30m -> 1h -> 2h (capped)
                             let mut state = app.write().await;
                             state.mark_account_stale("IB");
-                            ibkr_poll_interval = Duration::from_secs(900);
+                            if ibkr_poll_interval < Duration::from_secs(900) {
+                                ibkr_poll_interval = Duration::from_secs(900);
+                            } else {
+                                ibkr_poll_interval = (ibkr_poll_interval * 2).min(Duration::from_secs(7200));
+                            }
                         }
                     }
                 }
