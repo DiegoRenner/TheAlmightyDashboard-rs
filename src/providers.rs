@@ -1086,6 +1086,17 @@ impl Providers {
                     }
                 }
 
+                const totalMatch = bodyText.match(/Totalwert\s*([\d\x27\.]+)\s*CHF/);
+                const totalwert = totalMatch ? parseFloat(totalMatch[1].replace(/'/g, "")) : 0.0;
+                const cashTotal = items.reduce((sum, it) => sum + (it.value_chf || 0), 0);
+
+                if (!posTable && totalwert > cashTotal + 50.0) {
+                    return JSON.stringify({
+                        status: "positions_not_rendered",
+                        items: []
+                    });
+                }
+
                 return JSON.stringify({
                     status: "logged_in",
                     items: items
