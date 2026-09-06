@@ -1119,6 +1119,200 @@ impl Providers {
 
             None
         }
+
+    /// Fetch live Revolut balances (all currency accounts) from an active browser session via Chrome DevTools Protocol (CDP)
+    pub async fn fetch_revolut_balances(&self, fx: &crate::models::FxRates) -> Option<Vec<BalanceItem>> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let targets_resp = self
+            .client
+            .get("http://127.0.0.1:9222/json")
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .ok()?;
+        let targets: Value = targets_resp.json().await.ok()?;
+        let targets_arr = targets.as_array()?;
+
+        let mut ws_url = None;
+        for t in targets_arr {
+            let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let ty = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
+            if ty == "page"
+                && url.starts_with("https://app.revolut.com/")
+                && !url.contains("logged-out")
+                && let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|w| w.as_str())
+            {
+                ws_url = Some(ws.to_string());
+                break;
+            }
+        }
+
+        let ws_url = ws_url?;
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
+
+        let extract_js = r#"
+        (async () => {
+            const CURRENCY_MAP = {
+                "british pound": "GBP",
+                "swiss franc": "CHF",
+                "euro": "EUR",
+                "us dollar": "USD",
+                "japanese yen": "JPY",
+                "australian dollar": "AUD",
+                "canadian dollar": "CAD",
+                "singapore dollar": "SGD",
+                "norwegian krone": "NOK",
+                "swedish krona": "SEK",
+                "danish krone": "DKK",
+                "polish zloty": "PLN",
+                "gb": "GBP",
+                "ch": "CHF",
+                "eu": "EUR",
+                "us": "USD"
+            };
+
+            function parseAmount(txt) {
+                if (!txt) return null;
+                const cleaned = txt.replace(/[^0-9.,-]/g, "").trim();
+                if (!cleaned) return null;
+                const num = parseFloat(cleaned.replace(/'/g, "").replace(/,/g, ""));
+                return isNaN(num) ? null : num;
+            }
+
+            const accounts = [];
+            const selectBtn = document.querySelector("button[aria-label='Select account']");
+
+            if (selectBtn) {
+                selectBtn.click();
+                await new Promise(r => setTimeout(r, 400));
+            }
+
+            const dialog = document.querySelector("[role='dialog']");
+            if (dialog) {
+                const buttons = Array.from(dialog.querySelectorAll("button, [role='button']"));
+                for (const b of buttons) {
+                    const lines = b.innerText.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+                    if (lines.length >= 2 && !b.innerText.includes("Collapse")) {
+                        const name = lines[0];
+                        const amtStr = lines[1];
+                        const amt = parseAmount(amtStr);
+                        
+                        let curr = null;
+                        const lowerName = name.toLowerCase();
+                        for (const [k, v] of Object.entries(CURRENCY_MAP)) {
+                            if (lowerName.includes(k)) {
+                                curr = v;
+                                break;
+                            }
+                        }
+                        if (!curr) {
+                            const flagImg = b.querySelector("[style*='flags/']");
+                            if (flagImg) {
+                                const m = flagImg.style.cssText.match(/flags\/([A-Z]{2})\.svg/i);
+                                if (m) {
+                                    const code = m[1].toLowerCase();
+                                    curr = CURRENCY_MAP[code] || m[1].toUpperCase();
+                                }
+                            }
+                        }
+                        if (!curr) {
+                            if (amtStr.includes("£")) curr = "GBP";
+                            else if (amtStr.includes("CHF")) curr = "CHF";
+                            else if (amtStr.includes("€")) curr = "EUR";
+                            else if (amtStr.includes("$")) curr = "USD";
+                        }
+
+                        if (curr && amt !== null) {
+                            accounts.push({ currency: curr, amount: amt });
+                        }
+                    }
+                }
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27 }));
+                if (selectBtn) selectBtn.focus();
+            }
+
+            if (accounts.length === 0 && selectBtn) {
+                const parent = selectBtn.parentElement;
+                const parentText = parent ? parent.innerText : selectBtn.innerText;
+                const amt = parseAmount(selectBtn.innerText);
+                let curr = "GBP";
+                if (parentText.includes("GBP")) curr = "GBP";
+                else if (parentText.includes("CHF")) curr = "CHF";
+                else if (parentText.includes("EUR")) curr = "EUR";
+                else if (parentText.includes("USD")) curr = "USD";
+
+                if (amt !== null) {
+                    accounts.push({ currency: curr, amount: amt });
+                }
+            }
+
+            return JSON.stringify({
+                status: accounts.length > 0 ? "logged_in" : "not_found",
+                accounts: accounts
+            });
+        })()
+        "#;
+
+        let eval_msg = serde_json::json!({
+            "id": 2,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": extract_js,
+                "awaitPromise": true,
+                "returnByValue": true
+            }
+        }).to_string();
+
+        let _ = ws_stream.send(Message::Text(eval_msg.into())).await;
+
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(4) {
+            let msg = match tokio::time::timeout(Duration::from_millis(1500), ws_stream.next()).await {
+                Ok(Some(Ok(Message::Text(txt)))) => txt,
+                _ => break,
+            };
+
+            if let Ok(val) = serde_json::from_str::<Value>(&msg)
+                && val.get("id") == Some(&serde_json::json!(2))
+            {
+                if let Some(val_str) = val.pointer("/result/result/value").and_then(|v| v.as_str()) {
+                    return parse_revolut_json(val_str, fx);
+                }
+                break;
+            }
+        }
+
+        None
+    }
+}
+
+pub fn parse_revolut_json(json_str: &str, fx: &crate::models::FxRates) -> Option<Vec<BalanceItem>> {
+    let res = serde_json::from_str::<Value>(json_str).ok()?;
+    if res.get("status").and_then(|s| s.as_str()) != Some("logged_in") {
+        return None;
+    }
+    let accs = res.get("accounts")?.as_array()?;
+    if accs.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for acc in accs {
+        let curr = acc.get("currency").and_then(|c| c.as_str())?.to_string();
+        let amt = acc.get("amount").and_then(|a| a.as_f64())?;
+        let val_chf = fx.to_chf(&curr, amt);
+        items.push(BalanceItem {
+            account: "REV".to_string(),
+            category: crate::models::AccountCategory::Cash,
+            symbol: curr.clone(),
+            amount: amt,
+            native_currency: curr,
+            value_native: amt,
+            value_chf: (val_chf * 100.0).round() / 100.0,
+        });
+    }
+    Some(items)
 }
 
 pub fn parse_swissquote_json(json_str: &str) -> Option<Vec<BalanceItem>> {
@@ -1757,6 +1951,63 @@ mod tests {
             assert!(!items.is_empty());
         } else {
             println!("No active Swissquote tab or not logged in; safely handled as None");
+        }
+    }
+
+    #[test]
+    fn test_parse_revolut_json_valid() {
+        let fx = crate::models::FxRates {
+            usd_to_chf: 0.90,
+            eur_to_chf: 0.95,
+            gbp_to_chf: 1.10,
+            aud_to_chf: 0.58,
+        };
+        let sample = r#"{
+            "status": "logged_in",
+            "accounts": [
+                { "currency": "GBP", "amount": 33.40 },
+                { "currency": "CHF", "amount": 50.0 }
+            ]
+        }"#;
+        let parsed = parse_revolut_json(sample, &fx);
+        assert!(parsed.is_some());
+        let items = parsed.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].account, "REV");
+        assert_eq!(items[0].category, crate::models::AccountCategory::Cash);
+        assert_eq!(items[0].symbol, "GBP");
+        assert_eq!(items[0].amount, 33.40);
+        assert_eq!(items[0].value_native, 33.40);
+        assert_eq!(items[0].value_chf, 36.74); // 33.40 * 1.10 = 36.74 -> 36.74
+
+        assert_eq!(items[1].account, "REV");
+        assert_eq!(items[1].symbol, "CHF");
+        assert_eq!(items[1].amount, 50.0);
+        assert_eq!(items[1].value_chf, 50.0);
+    }
+
+    #[test]
+    fn test_parse_revolut_json_not_logged_in_or_empty() {
+        let fx = crate::models::FxRates::default();
+        assert!(parse_revolut_json(r#"{"status": "not_logged_in"}"#, &fx).is_none());
+        assert!(parse_revolut_json(r#"{"status": "logged_in", "accounts": []}"#, &fx).is_none());
+        assert!(parse_revolut_json("invalid json", &fx).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_revolut_live() {
+        let providers = Providers::new();
+        let fx = crate::models::FxRates {
+            usd_to_chf: 0.90,
+            eur_to_chf: 0.95,
+            gbp_to_chf: 1.10,
+            aud_to_chf: 0.58,
+        };
+        if let Some(items) = providers.fetch_revolut_balances(&fx).await {
+            println!("Fetched Revolut live items: {}", items.len());
+            assert!(!items.is_empty());
+        } else {
+            println!("No active Revolut tab or not logged in; safely handled as None");
         }
     }
 }
