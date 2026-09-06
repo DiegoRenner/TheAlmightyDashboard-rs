@@ -492,6 +492,9 @@ impl Providers {
         if let Some(r) = self.fetch_fx_rate("GBPCHF=X").await {
             rates.gbp_to_chf = r;
         }
+        if let Some(r) = self.fetch_fx_rate("AUDCHF=X").await {
+            rates.aud_to_chf = r;
+        }
         rates
     }
 
@@ -967,14 +970,8 @@ impl Providers {
 
     /// Fetch live Swissquote balances (Stocks and Cash) from an active browser session via Chrome DevTools Protocol (CDP)
     pub async fn fetch_swissquote_balances(&self) -> Option<Vec<BalanceItem>> {
-        #[cfg(test)]
-        {
-            return None;
-        }
-        #[cfg(not(test))]
-        {
-            use futures_util::{SinkExt, StreamExt};
-            use tokio_tungstenite::tungstenite::Message;
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
 
             let targets_resp = self
                 .client
@@ -1122,7 +1119,6 @@ impl Providers {
 
             None
         }
-    }
 }
 
 pub fn parse_swissquote_json(json_str: &str) -> Option<Vec<BalanceItem>> {
@@ -1751,6 +1747,17 @@ mod tests {
         assert!(parse_swissquote_json(r#"{"status": "not_logged_in"}"#).is_none());
         assert!(parse_swissquote_json(r#"{"status": "logged_in", "items": []}"#).is_none());
         assert!(parse_swissquote_json("invalid json").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_swissquote_live() {
+        let providers = Providers::new();
+        if let Some(items) = providers.fetch_swissquote_balances().await {
+            println!("Fetched Swissquote live items: {}", items.len());
+            assert!(!items.is_empty());
+        } else {
+            println!("No active Swissquote tab or not logged in; safely handled as None");
+        }
     }
 }
 

@@ -61,6 +61,7 @@ pub struct FxRates {
     pub usd_to_chf: f64,
     pub eur_to_chf: f64,
     pub gbp_to_chf: f64,
+    pub aud_to_chf: f64,
 }
 
 impl Default for FxRates {
@@ -69,6 +70,7 @@ impl Default for FxRates {
             usd_to_chf: 0.81,
             eur_to_chf: 0.94,
             gbp_to_chf: 1.09,
+            aud_to_chf: 0.584,
         }
     }
 }
@@ -80,6 +82,7 @@ impl FxRates {
             "USD" => amount * self.usd_to_chf,
             "EUR" => amount * self.eur_to_chf,
             "GBP" => amount * self.gbp_to_chf,
+            "AUD" => amount * self.aud_to_chf,
             _ => amount * self.usd_to_chf,
         }
     }
@@ -244,7 +247,9 @@ impl AppState {
             }
             let native_curr = self.balances[i].native_currency.clone();
             let val_nat = self.balances[i].value_native;
-            self.balances[i].value_chf = fx.to_chf(&native_curr, val_nat);
+            if self.balances[i].account != "SQ" {
+                self.balances[i].value_chf = fx.to_chf(&native_curr, val_nat);
+            }
         }
     }
 
@@ -379,6 +384,7 @@ mod tests {
             usd_to_chf: 0.80,
             eur_to_chf: 0.90,
             gbp_to_chf: 1.10,
+            aud_to_chf: 0.58,
         };
         state.balances.push(BalanceItem {
             account: "CB".to_string(),
@@ -424,6 +430,7 @@ mod tests {
             usd_to_chf: 0.81,
             eur_to_chf: 0.94,
             gbp_to_chf: 1.09,
+            aud_to_chf: 0.584,
         };
 
         state.balances.push(BalanceItem {
