@@ -717,7 +717,11 @@ impl Providers {
     }
 
     /// Fetch Interactive Brokers portfolio holdings (Cash and Stocks) via Flex Web Service
-    pub async fn fetch_ibkr_holdings(&self, token: &str, query_id: &str) -> Option<Vec<IbkrHolding>> {
+    pub async fn fetch_ibkr_holdings(
+        &self,
+        token: &str,
+        query_id: &str,
+    ) -> Option<(Vec<IbkrHolding>, Option<std::time::SystemTime>)> {
         if token.trim().is_empty() || query_id.trim().is_empty() {
             return None;
         }
@@ -750,8 +754,8 @@ impl Providers {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                     continue;
                 }
-                let holdings = parse_ibkr_statement_xml(&stmt_xml);
-                return Some(holdings);
+                let (holdings, stmt_time) = parse_ibkr_statement_xml(&stmt_xml);
+                return Some((holdings, stmt_time));
             }
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
@@ -1591,7 +1595,31 @@ pub fn parse_ibkr_send_request_xml(xml: &str) -> Result<String, String> {
     }
 }
 
-pub fn parse_ibkr_statement_xml(xml: &str) -> Vec<IbkrHolding> {
+pub fn parse_ibkr_timestamp(s: &str) -> Option<std::time::SystemTime> {
+    let clean = s.trim().replace(['"', '\''], "");
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&clean, "%Y%m%d;%H%M%S") {
+        let local_dt = dt
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .or_else(|| dt.and_local_timezone(chrono::Utc).earliest().map(|u| u.with_timezone(&chrono::Local)))?;
+        return Some(local_dt.into());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&clean, "%Y-%m-%d %H:%M:%S") {
+        let local_dt = dt
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .or_else(|| dt.and_local_timezone(chrono::Utc).earliest().map(|u| u.with_timezone(&chrono::Local)))?;
+        return Some(local_dt.into());
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(&clean, "%Y%m%d") {
+        let dt = d.and_hms_opt(23, 59, 59)?;
+        let local_dt = dt.and_local_timezone(chrono::Local).earliest()?;
+        return Some(local_dt.into());
+    }
+    None
+}
+
+pub fn parse_ibkr_statement_xml(xml: &str) -> (Vec<IbkrHolding>, Option<std::time::SystemTime>) {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
@@ -1599,6 +1627,7 @@ pub fn parse_ibkr_statement_xml(xml: &str) -> Vec<IbkrHolding> {
     reader.config_mut().trim_text(true);
 
     let mut holdings = Vec::new();
+    let mut stmt_time: Option<std::time::SystemTime> = None;
     let mut buf = Vec::new();
 
     loop {
@@ -1606,7 +1635,20 @@ pub fn parse_ibkr_statement_xml(xml: &str) -> Vec<IbkrHolding> {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.name();
                 let tag = name.as_ref();
-                if tag == "OpenPosition" {
+                if tag == "FlexStatement" || tag == "FlexQueryResponse" {
+                    for attr in e.attributes().flatten() {
+                        let key = attr.key.as_ref();
+                        if key == "whenGenerated"
+                            || key == "queryTimestamp"
+                            || (key == "toDate" && stmt_time.is_none())
+                        {
+                            let val = attr.value.as_ref();
+                            if let Some(t) = parse_ibkr_timestamp(val) {
+                                stmt_time = Some(t);
+                            }
+                        }
+                    }
+                } else if tag == "OpenPosition" {
                     let mut symbol = String::new();
                     let mut position: f64 = 0.0;
                     let mut mark_price: f64 = 0.0;
@@ -1668,7 +1710,7 @@ pub fn parse_ibkr_statement_xml(xml: &str) -> Vec<IbkrHolding> {
         buf.clear();
     }
 
-    holdings
+    (holdings, stmt_time)
 }
 
 fn normalize_kraken_asset(asset: &str) -> String {
@@ -1958,7 +2000,7 @@ mod tests {
     fn test_parse_ibkr_statement_xml() {
         let xml = r#"<FlexQueryResponse queryName="Portfolio" type="AF">
             <FlexStatements count="1">
-                <FlexStatement accountId="U1234567">
+                <FlexStatement accountId="U1234567" whenGenerated="20260905;021500">
                     <OpenPositions>
                         <OpenPosition accountId="U1234567" currency="USD" symbol="AAPL" position="10" markPrice="175.50" positionValue="1755.00" />
                         <OpenPosition accountId="U1234567" currency="CHF" symbol="NESN" position="20" markPrice="98.20" positionValue="1964.00" />
@@ -1972,8 +2014,9 @@ mod tests {
             </FlexStatements>
         </FlexQueryResponse>"#;
 
-        let holdings = parse_ibkr_statement_xml(xml);
+        let (holdings, maybe_time) = parse_ibkr_statement_xml(xml);
         assert_eq!(holdings.len(), 4);
+        assert!(maybe_time.is_some());
         assert_eq!(holdings[0].category, crate::models::AccountCategory::Stocks);
         assert_eq!(holdings[0].symbol, "AAPL");
         assert_eq!(holdings[0].amount, 10.0);
@@ -1993,6 +2036,14 @@ mod tests {
         assert_eq!(holdings[3].category, crate::models::AccountCategory::Cash);
         assert_eq!(holdings[3].symbol, "CHF");
         assert_eq!(holdings[3].amount, 850.00);
+    }
+
+    #[test]
+    fn test_parse_ibkr_timestamp() {
+        assert!(parse_ibkr_timestamp("20260905;021500").is_some());
+        assert!(parse_ibkr_timestamp("2026-09-05 02:15:00").is_some());
+        assert!(parse_ibkr_timestamp("20260905").is_some());
+        assert!(parse_ibkr_timestamp("invalid").is_none());
     }
 
     #[tokio::test]

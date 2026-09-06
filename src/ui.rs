@@ -41,7 +41,7 @@ pub fn render(f: &mut Frame, app: &AppState) {
             Span::styled("● ", Style::default().fg(field_color)),
             Span::styled(oldest.name.clone(), Style::default().fg(field_color).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!(" · gathered {} ago ({}) ", oldest.age_display(), oldest.time_display()),
+                format!(" · gathered {} ", oldest.time_display()),
                 Style::default().fg(Color::White),
             ),
         ]));
@@ -296,7 +296,7 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
             Span::styled("● ", Style::default().fg(field_color)),
             Span::styled(format!("{} ", oldest.name), Style::default().fg(field_color).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("(gathered {} ago · {})", oldest.age_display(), oldest.time_display()),
+                format!("(gathered {})", oldest.time_display()),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));

@@ -25,6 +25,7 @@ pub struct OutdatedField {
 }
 
 impl OutdatedField {
+    #[allow(dead_code)]
     pub fn age_display(&self) -> String {
         let s = self.elapsed_secs;
         if s < 60 {
@@ -39,11 +40,7 @@ impl OutdatedField {
     }
 
     pub fn time_display(&self) -> String {
-        if self.elapsed_secs < 86400 {
-            self.gathered_time.format("%H:%M:%S").to_string()
-        } else {
-            self.gathered_time.format("%d.%m %H:%M").to_string()
-        }
+        self.gathered_time.format("%d.%m.%Y %H:%M:%S").to_string()
     }
 
     pub fn status_color(&self) -> Color {
@@ -320,8 +317,17 @@ impl AppState {
     }
 
     pub fn update_account_balances(&mut self, account: &str, new_items: Vec<BalanceItem>) {
+        self.update_account_balances_with_time(account, new_items, std::time::SystemTime::now());
+    }
+
+    pub fn update_account_balances_with_time(
+        &mut self,
+        account: &str,
+        new_items: Vec<BalanceItem>,
+        gathered_at: std::time::SystemTime,
+    ) {
         self.account_sync.insert(account.to_string(), SyncStatus::Live);
-        self.account_last_gathered.insert(account.to_string(), std::time::SystemTime::now());
+        self.account_last_gathered.insert(account.to_string(), gathered_at);
         let mut updated = Vec::new();
         let mut inserted = false;
         for b in self.balances.drain(..) {
@@ -349,6 +355,19 @@ impl AppState {
         if let Some(path) = balance_cache_path() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
+                let ts_path = parent.join("account_timestamps.json");
+                let map: std::collections::HashMap<String, u64> = self
+                    .account_last_gathered
+                    .iter()
+                    .filter_map(|(acc, t)| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| (acc.clone(), d.as_secs()))
+                    })
+                    .collect();
+                if let Ok(json) = serde_json::to_string_pretty(&map) {
+                    let _ = std::fs::write(ts_path, json);
+                }
             }
             if let Ok(json) = serde_json::to_string_pretty(&self.balances) {
                 let _ = std::fs::write(&path, json);
@@ -357,21 +376,47 @@ impl AppState {
     }
 
     pub fn load_balance_cache(&mut self) {
-        if let Some(path) = balance_cache_path()
-            && let Ok(json) = std::fs::read_to_string(&path)
-            && let Ok(items) = serde_json::from_str::<Vec<BalanceItem>>(&json)
-            && !items.is_empty()
-        {
-            let mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .unwrap_or_else(|_| std::time::SystemTime::now());
-
-            self.balances = items;
-            for b in &self.balances {
-                self.account_sync.entry(b.account.clone()).or_insert(SyncStatus::Stale);
-                self.account_last_gathered.entry(b.account.clone()).or_insert(mtime);
+        if let Some(path) = balance_cache_path() {
+            let mut loaded_timestamps: std::collections::HashMap<String, std::time::SystemTime> =
+                std::collections::HashMap::new();
+            if let Some(parent) = path.parent() {
+                let ts_path = parent.join("account_timestamps.json");
+                if let Ok(ts_json) = std::fs::read_to_string(&ts_path)
+                    && let Ok(map) =
+                        serde_json::from_str::<std::collections::HashMap<String, u64>>(&ts_json)
+                {
+                    for (acc, secs) in map {
+                        loaded_timestamps.insert(
+                            acc,
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                        );
+                    }
+                }
             }
-            self.update_balance_values();
+
+            if let Ok(json) = std::fs::read_to_string(&path)
+                && let Ok(items) = serde_json::from_str::<Vec<BalanceItem>>(&json)
+                && !items.is_empty()
+            {
+                let mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or_else(|_| std::time::SystemTime::now());
+
+                self.balances = items;
+                for b in &self.balances {
+                    self.account_sync
+                        .entry(b.account.clone())
+                        .or_insert(SyncStatus::Stale);
+                    let ts = loaded_timestamps
+                        .get(&b.account)
+                        .copied()
+                        .unwrap_or(mtime);
+                    self.account_last_gathered
+                        .entry(b.account.clone())
+                        .or_insert(ts);
+                }
+                self.update_balance_values();
+            }
         }
     }
 
@@ -682,7 +727,7 @@ mod tests {
             gathered_time: now,
         };
         assert_eq!(field_sec.age_display(), "42s");
-        assert_eq!(field_sec.time_display(), now.format("%H:%M:%S").to_string());
+        assert_eq!(field_sec.time_display(), now.format("%d.%m.%Y %H:%M:%S").to_string());
         assert_eq!(field_sec.status_color(), ratatui::style::Color::Yellow);
 
         let field_min = OutdatedField {
@@ -716,7 +761,7 @@ mod tests {
             gathered_time: now,
         };
         assert_eq!(field_day.age_display(), "1d 03h");
-        assert_eq!(field_day.time_display(), now.format("%d.%m %H:%M").to_string());
+        assert_eq!(field_day.time_display(), now.format("%d.%m.%Y %H:%M:%S").to_string());
     }
 
     #[test]

@@ -451,7 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let should_poll = !matches!(last_ibkr_poll, Some(t) if t.elapsed() < ibkr_poll_interval);
                     if should_poll {
                         last_ibkr_poll = Some(Instant::now());
-                        if let Some(holdings) = prov.fetch_ibkr_holdings(tok, qid).await {
+                        if let Some((holdings, maybe_time)) = prov.fetch_ibkr_holdings(tok, qid).await {
                             ibkr_poll_interval = Duration::from_secs(600);
                             let fx = {
                                 let state = app.read().await;
@@ -471,7 +471,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 });
                             }
                             let mut state = app.write().await;
-                            state.update_account_balances("IB", ib_items);
+                            let gathered_time = maybe_time.unwrap_or_else(std::time::SystemTime::now);
+                            state.update_account_balances_with_time("IB", ib_items, gathered_time);
                         } else {
                             // Exponential backoff on error: 15m -> 30m -> 1h -> 2h (capped)
                             let mut state = app.write().await;
