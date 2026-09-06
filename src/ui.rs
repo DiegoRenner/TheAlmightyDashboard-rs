@@ -26,13 +26,26 @@ pub fn render(f: &mut Frame, app: &AppState) {
         .split(area);
 
     // 1. Header
-    let header_block = Block::default()
+    let mut header_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
             " The Almighty Dashboard ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
+
+    if let Some(oldest) = app.most_outdated_field() {
+        let field_color = oldest.status_color();
+        header_block = header_block.title_bottom(Line::from(vec![
+            Span::styled(" Most Outdated: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("● ", Style::default().fg(field_color)),
+            Span::styled(oldest.name.clone(), Style::default().fg(field_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" · gathered {} ago ({}) ", oldest.age_display(), oldest.time_display()),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
 
     let help_line = Line::from(vec![
         Span::styled("[q]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -130,14 +143,14 @@ fn render_tickers_table(f: &mut Frame, app: &AppState, area: Rect) {
 }
 
 fn render_balances_panel(f: &mut Frame, app: &AppState, area: Rect) {
-    if area.height < 12 {
+    if area.height < 13 {
         render_balances_table(f, app, area);
         return;
     }
 
     let sub_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(6)])
+        .constraints([Constraint::Min(6), Constraint::Length(7)])
         .split(area);
 
     render_balances_table(f, app, sub_chunks[0]);
@@ -258,7 +271,7 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
         ret_spans.push(Span::styled(" (stale session)", Style::default().fg(Color::LightRed)));
     }
 
-    let summary_lines = vec![
+    let mut summary_lines = vec![
         Line::from(vec![
             Span::styled(" Stocks & Cash: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(format!("CHF {} ", format_chf(stocks_cash_val)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -275,6 +288,19 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
             Span::styled(format!("(~${} USD)", format_chf(total_usd)), Style::default().fg(Color::DarkGray)),
         ]),
     ];
+
+    if let Some(oldest) = app.most_outdated_field() {
+        let field_color = oldest.status_color();
+        summary_lines.push(Line::from(vec![
+            Span::styled(" Oldest Data:   ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Span::styled("● ", Style::default().fg(field_color)),
+            Span::styled(format!("{} ", oldest.name), Style::default().fg(field_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("(gathered {} ago · {})", oldest.age_display(), oldest.time_display()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
 
     let summary_widget = Paragraph::new(summary_lines).block(
         Block::default()
@@ -359,6 +385,30 @@ mod tests {
         });
         app.mark_account_stale("FP");
 
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn test_render_with_outdated_field() {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = AppState::new(vec![], vec![]);
+
+        let now = std::time::SystemTime::now();
+        let past = now - std::time::Duration::from_secs(863); // 14m 23s
+
+        app.balances.push(crate::models::BalanceItem {
+            account: "UBS".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "CHF".to_string(),
+            amount: 250.0,
+            native_currency: "CHF".to_string(),
+            value_native: 250.0,
+            value_chf: 250.0,
+        });
+        app.account_last_gathered.insert("UBS".to_string(), past);
+
+        // Render should succeed and include outdated field
         terminal.draw(|f| render(f, &app)).unwrap();
     }
 }

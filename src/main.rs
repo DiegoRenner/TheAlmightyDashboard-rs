@@ -70,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.tickers[idx].price_str = price_str;
                             state.tickers[idx].price_num = price_num;
                             state.tickers[idx].last_success = Some(Instant::now());
+                            state.tickers[idx].last_gathered = Some(std::time::SystemTime::now());
                         }
                     }
                 }
@@ -96,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.tickers[pos].price_str = price_str;
                             state.tickers[pos].price_num = price_num;
                             state.tickers[pos].last_success = Some(Instant::now());
+                            state.tickers[pos].last_gathered = Some(std::time::SystemTime::now());
                         }
                         if let Some(p) = price_num {
                             state.set_crypto_price(&symbol, p);

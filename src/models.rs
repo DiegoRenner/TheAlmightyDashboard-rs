@@ -7,8 +7,54 @@ pub struct TickerItem {
     pub price_str: String,
     pub price_num: Option<f64>,
     pub last_success: Option<Instant>,
+    pub last_gathered: Option<std::time::SystemTime>,
     pub delay_ms: u64,
     pub is_crypto: bool,
+}
+
+use ratatui::style::Color;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutdatedField {
+    pub name: String,
+    pub is_session: bool,
+    pub is_stale: bool,
+    pub is_quote: bool,
+    pub elapsed_secs: u64,
+    pub gathered_time: chrono::DateTime<chrono::Local>,
+}
+
+impl OutdatedField {
+    pub fn age_display(&self) -> String {
+        let s = self.elapsed_secs;
+        if s < 60 {
+            format!("{}s", s)
+        } else if s < 3600 {
+            format!("{}m {:02}s", s / 60, s % 60)
+        } else if s < 86400 {
+            format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+        } else {
+            format!("{}d {:02}h", s / 86400, (s % 86400) / 3600)
+        }
+    }
+
+    pub fn time_display(&self) -> String {
+        if self.elapsed_secs < 86400 {
+            self.gathered_time.format("%H:%M:%S").to_string()
+        } else {
+            self.gathered_time.format("%d.%m %H:%M").to_string()
+        }
+    }
+
+    pub fn status_color(&self) -> Color {
+        if self.is_stale {
+            Color::LightRed
+        } else if self.is_session {
+            Color::LightCyan
+        } else {
+            Color::Yellow
+        }
+    }
 }
 
 impl TickerItem {
@@ -25,6 +71,7 @@ impl TickerItem {
             price_str: "unloaded".to_string(),
             price_num: None,
             last_success: None,
+            last_gathered: None,
             delay_ms: 0,
             is_crypto,
         }
@@ -112,6 +159,7 @@ pub struct AppState {
     pub fx_rates: FxRates,
     pub price_cache: std::collections::HashMap<String, f64>,
     pub account_sync: std::collections::HashMap<String, SyncStatus>,
+    pub account_last_gathered: std::collections::HashMap<String, std::time::SystemTime>,
     pub scroll_offset: usize,
     pub should_quit: bool,
 }
@@ -133,6 +181,7 @@ impl AppState {
             fx_rates: FxRates::default(),
             price_cache: std::collections::HashMap::new(),
             account_sync: std::collections::HashMap::new(),
+            account_last_gathered: std::collections::HashMap::new(),
             scroll_offset: 0,
             should_quit: false,
         }
@@ -272,6 +321,7 @@ impl AppState {
 
     pub fn update_account_balances(&mut self, account: &str, new_items: Vec<BalanceItem>) {
         self.account_sync.insert(account.to_string(), SyncStatus::Live);
+        self.account_last_gathered.insert(account.to_string(), std::time::SystemTime::now());
         let mut updated = Vec::new();
         let mut inserted = false;
         for b in self.balances.drain(..) {
@@ -312,12 +362,82 @@ impl AppState {
             && let Ok(items) = serde_json::from_str::<Vec<BalanceItem>>(&json)
             && !items.is_empty()
         {
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or_else(|_| std::time::SystemTime::now());
+
             self.balances = items;
             for b in &self.balances {
                 self.account_sync.entry(b.account.clone()).or_insert(SyncStatus::Stale);
+                self.account_last_gathered.entry(b.account.clone()).or_insert(mtime);
             }
             self.update_balance_values();
         }
+    }
+
+    pub fn most_outdated_account(&self) -> Option<OutdatedField> {
+        let now = std::time::SystemTime::now();
+        let mut candidates: Vec<OutdatedField> = Vec::new();
+        let mut accounts_seen = std::collections::HashSet::new();
+
+        for b in &self.balances {
+            if accounts_seen.insert(b.account.clone()) {
+                let time = self.account_last_gathered.get(&b.account).copied().unwrap_or(now);
+                let elapsed = now.duration_since(time).unwrap_or_default().as_secs();
+                let is_sess = Self::is_session_dependent(&b.account);
+                let is_stale = self.is_account_stale(&b.account);
+                let name = if is_sess {
+                    format!("{}*", b.account)
+                } else {
+                    b.account.clone()
+                };
+
+                candidates.push(OutdatedField {
+                    name,
+                    is_session: is_sess,
+                    is_stale,
+                    is_quote: false,
+                    elapsed_secs: elapsed,
+                    gathered_time: time.into(),
+                });
+            }
+        }
+
+        candidates.into_iter().max_by_key(|c| c.elapsed_secs)
+    }
+
+    pub fn most_outdated_ticker(&self) -> Option<OutdatedField> {
+        let now = std::time::SystemTime::now();
+        let mut candidates: Vec<OutdatedField> = Vec::new();
+
+        for t in &self.tickers {
+            if let Some(time) = t.last_gathered {
+                let elapsed = now.duration_since(time).unwrap_or_default().as_secs();
+                candidates.push(OutdatedField {
+                    name: t.symbol.clone(),
+                    is_session: false,
+                    is_stale: false,
+                    is_quote: true,
+                    elapsed_secs: elapsed,
+                    gathered_time: time.into(),
+                });
+            }
+        }
+
+        candidates.into_iter().max_by_key(|c| c.elapsed_secs)
+    }
+
+    pub fn most_outdated_field(&self) -> Option<OutdatedField> {
+        let mut candidates: Vec<OutdatedField> = Vec::new();
+
+        if let Some(acc) = self.most_outdated_account() {
+            candidates.push(acc);
+        }
+        if let Some(tick) = self.most_outdated_ticker() {
+            candidates.push(tick);
+        }
+
+        candidates.into_iter().max_by_key(|c| c.elapsed_secs)
     }
 }
 
@@ -548,6 +668,101 @@ mod tests {
         assert!(state.is_account_stale("UH"));
         state.mark_account_live("UH");
         assert!(!state.is_account_stale("UH"));
+    }
+
+    #[test]
+    fn test_outdated_field_displays_and_colors() {
+        let now = chrono::Local::now();
+        let field_sec = OutdatedField {
+            name: "BTC".to_string(),
+            is_session: false,
+            is_stale: false,
+            is_quote: true,
+            elapsed_secs: 42,
+            gathered_time: now,
+        };
+        assert_eq!(field_sec.age_display(), "42s");
+        assert_eq!(field_sec.time_display(), now.format("%H:%M:%S").to_string());
+        assert_eq!(field_sec.status_color(), ratatui::style::Color::Yellow);
+
+        let field_min = OutdatedField {
+            name: "UBS*".to_string(),
+            is_session: true,
+            is_stale: false,
+            is_quote: false,
+            elapsed_secs: 863, // 14m 23s
+            gathered_time: now,
+        };
+        assert_eq!(field_min.age_display(), "14m 23s");
+        assert_eq!(field_min.status_color(), ratatui::style::Color::LightCyan);
+
+        let field_hour = OutdatedField {
+            name: "FP*".to_string(),
+            is_session: true,
+            is_stale: true,
+            is_quote: false,
+            elapsed_secs: 7320, // 2h 02m
+            gathered_time: now,
+        };
+        assert_eq!(field_hour.age_display(), "2h 02m");
+        assert_eq!(field_hour.status_color(), ratatui::style::Color::LightRed);
+
+        let field_day = OutdatedField {
+            name: "IB".to_string(),
+            is_session: false,
+            is_stale: false,
+            is_quote: false,
+            elapsed_secs: 100000,
+            gathered_time: now,
+        };
+        assert_eq!(field_day.age_display(), "1d 03h");
+        assert_eq!(field_day.time_display(), now.format("%d.%m %H:%M").to_string());
+    }
+
+    #[test]
+    fn test_most_outdated_field_selection() {
+        let mut state = AppState::new(vec![], vec![]);
+        let now = std::time::SystemTime::now();
+        let ten_mins_ago = now - std::time::Duration::from_secs(600);
+        let five_mins_ago = now - std::time::Duration::from_secs(300);
+
+        state.balances.push(BalanceItem {
+            account: "IB".to_string(),
+            category: AccountCategory::Stocks,
+            symbol: "AAPL".to_string(),
+            amount: 10.0,
+            native_currency: "USD".to_string(),
+            value_native: 1500.0,
+            value_chf: 1200.0,
+        });
+        state.account_last_gathered.insert("IB".to_string(), five_mins_ago);
+
+        state.balances.push(BalanceItem {
+            account: "UBS".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "CHF".to_string(),
+            amount: 100.0,
+            native_currency: "CHF".to_string(),
+            value_native: 100.0,
+            value_chf: 100.0,
+        });
+        state.account_last_gathered.insert("UBS".to_string(), ten_mins_ago);
+
+        // Account UBS is older than IB
+        let oldest_acc = state.most_outdated_account().unwrap();
+        assert_eq!(oldest_acc.name, "UBS*");
+        assert!(oldest_acc.elapsed_secs >= 600);
+
+        // Add ticker that is even older (15 mins ago)
+        let fifteen_mins_ago = now - std::time::Duration::from_secs(900);
+        let mut ticker = TickerItem::new("BTC-USD", true);
+        ticker.last_gathered = Some(fifteen_mins_ago);
+        state.tickers.push(ticker);
+
+        let oldest = state.most_outdated_field().unwrap();
+        assert_eq!(oldest.name, "BTC-USD");
+        assert!(oldest.is_quote);
+        assert!(oldest.elapsed_secs >= 900);
     }
 }
 
