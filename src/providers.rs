@@ -1,3 +1,4 @@
+use crate::models::BalanceItem;
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
@@ -963,6 +964,179 @@ impl Providers {
             None
         }
     }
+
+    /// Fetch live Swissquote balances (Stocks and Cash) from an active browser session via Chrome DevTools Protocol (CDP)
+    pub async fn fetch_swissquote_balances(&self) -> Option<Vec<BalanceItem>> {
+        #[cfg(test)]
+        {
+            return None;
+        }
+        #[cfg(not(test))]
+        {
+            use futures_util::{SinkExt, StreamExt};
+            use tokio_tungstenite::tungstenite::Message;
+
+            let targets_resp = self
+                .client
+                .get("http://127.0.0.1:9222/json")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .ok()?;
+            let targets: Value = targets_resp.json().await.ok()?;
+            let targets_arr = targets.as_array()?;
+
+            let mut ws_url = None;
+            for t in targets_arr {
+                let url = t.get("url").and_then(|u| u.as_str()).unwrap_or("");
+                let ty = t.get("type").and_then(|ty| ty.as_str()).unwrap_or("");
+                if url.contains("swissquote") && ty == "page"
+                    && let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
+                        ws_url = Some(ws.to_string());
+                        break;
+                    }
+            }
+
+            let ws_url = ws_url?;
+            let (mut ws_stream, _) = tokio_tungstenite::connect_async(ws_url).await.ok()?;
+
+            let rt_enable = serde_json::json!({ "id": 1, "method": "Runtime.enable" }).to_string();
+            let _ = ws_stream.send(Message::Text(rt_enable.into())).await;
+
+            let extract_js = r#"
+            (() => {
+                const bodyText = document.body ? document.body.innerText : "";
+                if (!bodyText.includes("Totalwert") || (!bodyText.includes("Positionen") && !bodyText.includes("Barguthaben"))) {
+                    return JSON.stringify({ status: "not_logged_in" });
+                }
+
+                const items = [];
+                const tables = Array.from(document.querySelectorAll("table.s-table"));
+                const currTable = tables.find(t => t.innerText.includes("Währung") && t.innerText.includes("Kontosaldo"));
+
+                let foundCash = false;
+                if (currTable) {
+                    for (const tr of currTable.querySelectorAll("tbody tr, tr")) {
+                        const cells = Array.from(tr.cells || tr.children).map(c => c.innerText.trim());
+                        if (cells.length >= 6) {
+                            const curr = cells[1];
+                            const rawKurs = cells[2].replace(/'/g, "");
+                            const rawSaldo = cells[3].replace(/'/g, "");
+                            const saldo = parseFloat(rawSaldo);
+                            const kurs = parseFloat(rawKurs) || 1.0;
+                            if (curr && !isNaN(saldo) && saldo > 0.0001 && curr !== "Gesamt CHF") {
+                                const valChf = (curr === "CHF") ? saldo : (saldo * kurs);
+                                items.push({
+                                    account: "SQ",
+                                    category: "Cash",
+                                    symbol: curr,
+                                    amount: saldo,
+                                    native_currency: curr,
+                                    value_native: saldo,
+                                    value_chf: Math.round(valChf * 100) / 100
+                                });
+                                foundCash = true;
+                            }
+                        }
+                    }
+                }
+
+                if (!foundCash) {
+                    const m = bodyText.match(/(?:Barguthaben|Verfügbarer Betrag)\s*([\d\x27\.]+)\s*CHF/);
+                    if (m) {
+                        const cash = parseFloat(m[1].replace(/'/g, ""));
+                        if (!isNaN(cash) && cash > 0) {
+                            items.push({
+                                account: "SQ",
+                                category: "Cash",
+                                symbol: "CHF",
+                                amount: cash,
+                                native_currency: "CHF",
+                                value_native: cash,
+                                value_chf: cash
+                            });
+                        }
+                    }
+                }
+
+                const posTable = tables.find(t => t.innerText.includes("Produkt") && t.innerText.includes("Anzahl") && t.innerText.includes("Totalwert CHF"));
+                if (posTable) {
+                    for (const tr of posTable.querySelectorAll("tbody tr, tr")) {
+                        const cells = Array.from(tr.cells || tr.children).map(c => c.innerText.trim());
+                        if (cells.length >= 15 && cells[0] === "BuySell") {
+                            const symbol = cells[2];
+                            const amount = parseFloat(cells[3].replace(/'/g, ""));
+                            const valNative = parseFloat(cells[5].replace(/'/g, ""));
+                            const nativeCurr = cells[10] || "CHF";
+                            const valChf = parseFloat(cells[14].replace(/'/g, ""));
+
+                            if (symbol && !isNaN(amount) && amount > 0) {
+                                items.push({
+                                    account: "SQ",
+                                    category: "Stocks",
+                                    symbol: symbol,
+                                    amount: amount,
+                                    native_currency: nativeCurr,
+                                    value_native: !isNaN(valNative) ? valNative : (valChf || 0),
+                                    value_chf: !isNaN(valChf) ? valChf : (valNative || 0)
+                                });
+                            }
+                        }
+                    }
+                }
+
+                return JSON.stringify({
+                    status: "logged_in",
+                    items: items
+                });
+            })()
+            "#;
+
+            let eval_msg = serde_json::json!({
+                "id": 2,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": extract_js,
+                    "returnByValue": true
+                }
+            }).to_string();
+
+            let _ = ws_stream.send(Message::Text(eval_msg.into())).await;
+
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(4) {
+                let msg = match tokio::time::timeout(Duration::from_millis(1500), ws_stream.next()).await {
+                    Ok(Some(Ok(Message::Text(txt)))) => txt,
+                    _ => break,
+                };
+
+                if let Ok(val) = serde_json::from_str::<Value>(&msg)
+                    && val.get("id") == Some(&serde_json::json!(2))
+                {
+                    if let Some(val_str) = val.pointer("/result/result/value").and_then(|v| v.as_str()) {
+                        return parse_swissquote_json(val_str);
+                    }
+                    break;
+                }
+            }
+
+            None
+        }
+    }
+}
+
+pub fn parse_swissquote_json(json_str: &str) -> Option<Vec<BalanceItem>> {
+    let res = serde_json::from_str::<Value>(json_str).ok()?;
+    if res.get("status").and_then(|s| s.as_str()) != Some("logged_in") {
+        return None;
+    }
+    let items_val = res.get("items")?;
+    let items = serde_json::from_value::<Vec<BalanceItem>>(items_val.clone()).ok()?;
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
 }
 
 pub fn parse_finpension_portfolios_json(val: &Value) -> Option<Vec<(String, f64)>> {
@@ -1531,6 +1705,52 @@ mod tests {
                     println!("Starling API rate limited or unavailable; safely handled as None");
                 }
             }
+    }
+
+    #[test]
+    fn test_parse_swissquote_json_valid() {
+        let sample = r#"{
+            "status": "logged_in",
+            "items": [
+                {
+                    "account": "SQ",
+                    "category": "Cash",
+                    "symbol": "CHF",
+                    "amount": 250.0,
+                    "native_currency": "CHF",
+                    "value_native": 250.0,
+                    "value_chf": 250.0
+                },
+                {
+                    "account": "SQ",
+                    "category": "Stocks",
+                    "symbol": "AMRZ",
+                    "amount": 40.0,
+                    "native_currency": "CHF",
+                    "value_native": 1480.00,
+                    "value_chf": 1480.00
+                }
+            ]
+        }"#;
+        let parsed = parse_swissquote_json(sample);
+        assert!(parsed.is_some());
+        let items = parsed.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].account, "SQ");
+        assert_eq!(items[0].category, crate::models::AccountCategory::Cash);
+        assert_eq!(items[0].symbol, "CHF");
+        assert_eq!(items[0].amount, 250.0);
+        assert_eq!(items[1].account, "SQ");
+        assert_eq!(items[1].category, crate::models::AccountCategory::Stocks);
+        assert_eq!(items[1].symbol, "AMRZ");
+        assert_eq!(items[1].value_chf, 1480.00);
+    }
+
+    #[test]
+    fn test_parse_swissquote_json_not_logged_in_or_empty() {
+        assert!(parse_swissquote_json(r#"{"status": "not_logged_in"}"#).is_none());
+        assert!(parse_swissquote_json(r#"{"status": "logged_in", "items": []}"#).is_none());
+        assert!(parse_swissquote_json("invalid json").is_none());
     }
 }
 

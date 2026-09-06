@@ -148,6 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ibkr_poll_interval = Duration::from_secs(600);
             let mut last_finpension_poll: Option<Instant> = None;
             let mut finpension_poll_interval = Duration::from_secs(600);
+            let mut last_swissquote_poll: Option<Instant> = None;
+            let mut swissquote_poll_interval = Duration::from_secs(60);
 
             loop {
                 // Check Monero balances (MW)
@@ -505,6 +507,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut state = app.write().await;
                         state.mark_account_stale("FP");
                         finpension_poll_interval = Duration::from_secs(120);
+                    }
+                }
+
+                // Check Swissquote balances (SQ)
+                let should_poll = !matches!(last_swissquote_poll, Some(t) if t.elapsed() < swissquote_poll_interval);
+                if should_poll {
+                    last_swissquote_poll = Some(Instant::now());
+                    if let Some(sq_items) = prov.fetch_swissquote_balances().await {
+                        swissquote_poll_interval = Duration::from_secs(300);
+                        let mut state = app.write().await;
+                        state.update_account_balances("SQ", sq_items);
+                    } else {
+                        let has_sq = {
+                            let state = app.read().await;
+                            state.balances.iter().any(|b| b.account == "SQ")
+                        };
+                        if has_sq {
+                            let mut state = app.write().await;
+                            state.mark_account_stale("SQ");
+                        }
+                        swissquote_poll_interval = Duration::from_secs(60);
                     }
                 }
 
