@@ -137,8 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let starling_tok = config.starling_token.clone();
         let kraken_key = config.kraken_api_key.clone();
         let kraken_secret = config.kraken_api_secret.clone();
-        let ibkr_tok = config.ibkr_flex_token.clone();
-        let ibkr_qid = config.ibkr_query_id.clone();
+        let mut ibkr_tok = config.ibkr_flex_token.clone();
+        let mut ibkr_qid = config.ibkr_query_id.clone();
         let mut finpension_tok = config.finpension_token.clone();
 
         tokio::spawn(async move {
@@ -423,6 +423,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Check Interactive Brokers balances (IB)
+                if let Ok(fresh_cfg) = crate::config::Config::load_or_default::<&str>(None) {
+                    if fresh_cfg.ibkr_flex_token != ibkr_tok {
+                        ibkr_tok = fresh_cfg.ibkr_flex_token;
+                        last_ibkr_poll = None;
+                    }
+                    if fresh_cfg.ibkr_query_id != ibkr_qid {
+                        ibkr_qid = fresh_cfg.ibkr_query_id;
+                        last_ibkr_poll = None;
+                    }
+                }
+
                 if let (Some(tok), Some(qid)) = (&ibkr_tok, &ibkr_qid) {
                     let should_poll = !matches!(last_ibkr_poll, Some(t) if t.elapsed() < ibkr_poll_interval);
                     if should_poll {
@@ -449,10 +460,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut state = app.write().await;
                             state.update_account_balances("IB", ib_items);
                         } else {
-                            // Backoff on rate limit or error
+                            // Backoff on rate limit or error (15 minutes to allow IBKR lockout to clear)
                             let mut state = app.write().await;
                             state.mark_account_stale("IB");
-                            ibkr_poll_interval = Duration::from_secs(120);
+                            ibkr_poll_interval = Duration::from_secs(900);
                         }
                     }
                 }
