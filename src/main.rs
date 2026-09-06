@@ -451,20 +451,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let should_poll = !matches!(last_ibkr_poll, Some(t) if t.elapsed() < ibkr_poll_interval);
                     if should_poll {
                         last_ibkr_poll = Some(Instant::now());
-                        let mut maybe_result = prov.fetch_ibkr_holdings(tok, qid).await;
-                        if maybe_result.is_none() {
-                            for fallback_path in &["Dashboard.xml", "../Dashboard.xml"] {
-                                if let Ok(xml) = std::fs::read_to_string(fallback_path) {
-                                    let (holdings, maybe_time) = crate::providers::parse_ibkr_statement_xml(&xml);
-                                    if !holdings.is_empty() {
-                                        maybe_result = Some((holdings, maybe_time));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some((holdings, maybe_time)) = maybe_result {
+                        if let Some((holdings, maybe_time)) = prov.fetch_ibkr_holdings(tok, qid).await {
                             ibkr_poll_interval = Duration::from_secs(600);
                             let fx = {
                                 let state = app.read().await;
