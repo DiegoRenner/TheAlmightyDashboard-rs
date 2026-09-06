@@ -206,7 +206,27 @@ fn render_balances_table(f: &mut Frame, app: &AppState, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(" Holdings & Accounts (*=Session Feed · Yellow=API/Daemon · Cyan=Live Session · Red=Stale) ", Style::default().add_modifier(Modifier::BOLD))),
+            .title(Line::from(vec![
+                Span::styled(" Holdings & Accounts ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("(", Style::default().fg(Color::DarkGray)),
+                Span::styled("● API", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled("●* Session", Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled("● Stale", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)),
+                Span::styled(") ", Style::default().fg(Color::DarkGray)),
+            ]))
+            .title_bottom(Line::from(vec![
+                Span::styled(" Categories: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("● Stocks", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled("● Cash", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled("● Crypto", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled("● Retirement", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+            ])),
     );
 
     f.render_widget(table, area);
