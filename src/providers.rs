@@ -565,15 +565,8 @@ impl Providers {
             _ => return None,
         };
 
-        let json: Value = match resp.json().await {
-            Ok(j) => j,
-            Err(_) => return None,
-        };
-
-        let accounts = match json.get("accounts").and_then(|a| a.as_array()) {
-            Some(arr) => arr,
-            None => return None,
-        };
+        let json: Value = resp.json().await.ok()?;
+        let accounts = json.get("accounts").and_then(|a| a.as_array())?;
 
         let mut results = Vec::new();
         for acc in accounts {
@@ -582,49 +575,55 @@ impl Providers {
                 None => continue,
             };
 
+            // Respect Starling's burst limit with 1000ms pacing between account queries
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+
             let balance_url = format!("https://api.starlingbank.com/api/v2/accounts/{account_uid}/balance");
-            if let Ok(b_resp) = self
+            let b_resp = match self
                 .client
                 .get(&balance_url)
                 .header("Authorization", format!("Bearer {token}"))
                 .send()
                 .await
-                && b_resp.status().is_success()
-                && let Ok(b_json) = b_resp.json::<Value>().await
             {
-                let minor_units = b_json
-                    .get("totalEffectiveBalance")
-                    .and_then(|eb| eb.get("minorUnits"))
-                    .and_then(|m| m.as_f64())
-                    .or_else(|| {
-                        b_json
-                            .get("totalClearedBalance")
-                            .and_then(|eb| eb.get("minorUnits"))
-                            .and_then(|m| m.as_f64())
-                    })
-                    .or_else(|| {
-                        b_json
-                            .get("effectiveBalance")
-                            .and_then(|eb| eb.get("minorUnits"))
-                            .and_then(|m| m.as_f64())
-                    })
-                    .unwrap_or(0.0);
+                Ok(r) if r.status().is_success() => r,
+                _ => return None,
+            };
 
-                let currency = b_json
-                    .get("totalEffectiveBalance")
-                    .and_then(|eb| eb.get("currency"))
-                    .or_else(|| b_json.get("effectiveBalance").and_then(|eb| eb.get("currency")))
-                    .and_then(|c| c.as_str())
-                    .or_else(|| acc.get("currency").and_then(|c| c.as_str()))
-                    .unwrap_or("GBP")
-                    .to_string();
+            let b_json: Value = b_resp.json().await.ok()?;
 
-                let balance = minor_units / 100.0;
-                if let Some(existing) = results.iter_mut().find(|(c, _)| c == &currency) {
-                    existing.1 += balance;
-                } else {
-                    results.push((currency, balance));
-                }
+            let minor_units = b_json
+                .get("totalEffectiveBalance")
+                .and_then(|eb| eb.get("minorUnits"))
+                .and_then(|m| m.as_f64())
+                .or_else(|| {
+                    b_json
+                        .get("totalClearedBalance")
+                        .and_then(|eb| eb.get("minorUnits"))
+                        .and_then(|m| m.as_f64())
+                })
+                .or_else(|| {
+                    b_json
+                        .get("effectiveBalance")
+                        .and_then(|eb| eb.get("minorUnits"))
+                        .and_then(|m| m.as_f64())
+                })
+                .unwrap_or(0.0);
+
+            let currency = b_json
+                .get("totalEffectiveBalance")
+                .and_then(|eb| eb.get("currency"))
+                .or_else(|| b_json.get("effectiveBalance").and_then(|eb| eb.get("currency")))
+                .and_then(|c| c.as_str())
+                .or_else(|| acc.get("currency").and_then(|c| c.as_str()))
+                .unwrap_or("GBP")
+                .to_string();
+
+            let balance = minor_units / 100.0;
+            if let Some(existing) = results.iter_mut().find(|(c, _)| c == &currency) {
+                existing.1 += balance;
+            } else {
+                results.push((currency, balance));
             }
         }
 
