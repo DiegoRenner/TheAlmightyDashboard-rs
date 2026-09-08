@@ -1,5 +1,6 @@
 mod config;
 mod models;
+mod pdf;
 mod providers;
 mod ui;
 
@@ -30,6 +31,10 @@ struct Args {
     /// Path to config JSON file
     #[arg(value_name = "CONFIG")]
     config: Option<PathBuf>,
+
+    /// Export holdings directly to a timestamped PDF statement and exit
+    #[arg(short, long)]
+    export_pdf: bool,
 }
 
 #[tokio::main]
@@ -72,6 +77,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let providers = Arc::new(Providers::new());
+
+    // If headless PDF export was requested via CLI, export now and exit
+    if args.export_pdf {
+        // the FX worker below never runs on this path, so fetch rates here: without them the
+        // statement would be priced (and labelled) with the hardcoded fallback constants
+        let rates = providers.fetch_fx_rates().await;
+        if rates == models::FxRates::default() {
+            eprintln!("! Live FX rates unavailable; statement uses fallback rates");
+        }
+        let mut state = app_state.write().await;
+        state.fx_rates = rates;
+        state.update_balance_values();
+        match pdf::export_pdf(&state) {
+            Ok(path) => {
+                println!("✓ Successfully exported portfolio statement to: {path}");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("✗ Error exporting PDF: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Setup terminal with panic hook for safe recovery
     setup_panic_hook();
@@ -762,6 +790,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.custom_cash_selected_index = 0;
                             state.input_buffer.clear();
                             state.input_error = None;
+                        }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            // Build the document under the lock, but compile it off the event loop:
+                            // two pdflatex runs would otherwise freeze the UI and every provider task.
+                            let tex = pdf::generate_latex(&state);
+                            state.set_notification("Exporting PDF...".to_string());
+                            let app = Arc::clone(&app_state);
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || pdf::compile_pdf(&tex, None))
+                                    .await
+                                    .unwrap_or_else(|e| Err(e.to_string()));
+                                let message = match result {
+                                    Ok(path) => {
+                                        let filename = std::path::Path::new(&path)
+                                            .file_name()
+                                            .and_then(|f| f.to_str())
+                                            .unwrap_or(&path)
+                                            .to_string();
+                                        format!("PDF Exported: {filename}")
+                                    }
+                                    Err(e) => format!("PDF Error: {}", e.lines().next().unwrap_or("unknown")),
+                                };
+                                app.write().await.set_notification(message);
+                            });
                         }
                         _ => {}
                     }

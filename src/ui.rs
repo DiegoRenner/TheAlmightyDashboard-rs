@@ -79,6 +79,8 @@ pub fn render(f: &mut Frame, app: &AppState) {
         Span::styled(privacy_desc, privacy_style),
         Span::styled("[c]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::raw(" Custom Cash "),
+        Span::styled("[e]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::raw(" PDF "),
         Span::styled(
             format!(
                 "| FX: USD {:.3} EUR {:.3} GBP {:.3} ",
@@ -390,20 +392,26 @@ fn render_summary_card(f: &mut Frame, app: &AppState, area: Rect) {
 }
 
 pub fn format_chf(val: f64) -> String {
-    let int_part = val.trunc().abs() as u64;
-    let frac_part = (val.fract().abs() * 100.0).round() as u64;
-    let sign = if val < -0.001 { "-" } else { "" };
+    format_grouped(val, 2)
+}
 
-    let s = int_part.to_string();
-    let mut formatted_int = String::new();
-    let len = s.len();
-    for (i, ch) in s.chars().enumerate() {
+/// Rounds to `decimals` places and groups thousands with apostrophes; rounding happens before
+/// splitting so 2.999 becomes "3.00", not "2.00".
+pub fn format_grouped(val: f64, decimals: usize) -> String {
+    let rounded = format!("{:.*}", decimals, val.abs());
+    let (int_part, frac) = rounded.split_once('.').unwrap_or((&rounded, ""));
+    let mut out = String::new();
+    let len = int_part.len();
+    for (i, ch) in int_part.chars().enumerate() {
         if i > 0 && (len - i).is_multiple_of(3) {
-            formatted_int.push('\'');
+            out.push('\'');
         }
-        formatted_int.push(ch);
+        out.push(ch);
     }
-    format!("{}{}.{:02}", sign, formatted_int, frac_part % 100)
+    let negative = val < 0.0 && rounded.chars().any(|c| c != '0' && c != '.');
+    let sign = if negative { "-" } else { "" };
+    let dot = if frac.is_empty() { "" } else { "." };
+    format!("{sign}{out}{dot}{frac}")
 }
 
 fn format_balance_amount(amount: f64) -> String {
@@ -564,6 +572,10 @@ mod tests {
         assert_eq!(format_chf(2370.34), "2'370.34");
         assert_eq!(format_chf(45655.52), "45'655.52");
         assert_eq!(format_chf(-1500.25), "-1'500.25");
+        assert_eq!(format_chf(2.999), "3.00");
+        assert_eq!(format_chf(1999.996), "2'000.00");
+        assert_eq!(format_chf(-0.001), "0.00");
+        assert_eq!(format_grouped(1234.99996, 4), "1'235.0000");
     }
 
     #[test]
