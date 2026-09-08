@@ -11,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use models::{AccountCategory, AppState, BalanceItem};
+use models::{AccountCategory, AppState, BalanceItem, CustomCashModalMode};
 use providers::Providers;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -44,6 +44,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )));
     app_state.write().await.load_balance_cache();
 
+    {
+        let mut state = app_state.write().await;
+        state.config_path = config.path.clone();
+        state.custom_cash_items = config.custom_cash();
+        state.apply_custom_cash_items();
+        let rejected = config.rejected_cash_names();
+        if !rejected.is_empty() {
+            state.set_notification(format!("Ignored invalid cash entries: {}", rejected.join(", ")));
+        }
+
+        // Ensure Starling (ST) is tracked if configured, preventing it from vanishing during rate limits
+        if config.starling_token.as_ref().map(|t| !t.is_empty()).unwrap_or(false)
+            && !state.balances.iter().any(|b| b.account == "ST")
+        {
+            state.balances.push(BalanceItem {
+                account: "ST".to_string(),
+                category: AccountCategory::Cash,
+                symbol: "GBP".to_string(),
+                amount: 0.0,
+                native_currency: "GBP".to_string(),
+                value_native: 0.0,
+                value_chf: 0.0,
+            });
+            state.mark_account_stale("ST");
+        }
+    }
+
+    let providers = Arc::new(Providers::new());
+
     // Setup terminal with panic hook for safe recovery
     setup_panic_hook();
     enable_raw_mode()?;
@@ -51,8 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     execute!(stdout, EnterAlternateScreen, Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    let providers = Arc::new(Providers::new());
 
     // 1. Background worker: Stocks
     {
@@ -348,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if should_poll {
                         last_starling_poll = Some(Instant::now());
                         if let Some(st_balances) = prov.fetch_starling_balances(tok).await {
-                            starling_poll_interval = Duration::from_secs(60);
+                            starling_poll_interval = Duration::from_secs(180);
                             let fx = {
                                 let state = app.read().await;
                                 state.fx_rates
@@ -369,10 +396,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut state = app.write().await;
                             state.update_account_balances("ST", st_items);
                         } else {
-                            // Backoff on rate limit or error
+                            // Backoff on rate limit or error (5 min)
                             let mut state = app.write().await;
                             state.mark_account_stale("ST");
-                            starling_poll_interval = Duration::from_secs(120);
+                            starling_poll_interval = Duration::from_secs(300);
                         }
                     }
                 }
@@ -623,21 +650,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if event::poll(tick_rate)?
             && let Event::Key(key) = event::read()? {
                 let mut state = app_state.write().await;
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        state.should_quit = true;
-                        break;
+                if state.custom_cash_modal_open {
+                    match state.custom_cash_modal_mode {
+                        CustomCashModalMode::List => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                state.custom_cash_modal_open = false;
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if !state.custom_cash_items.is_empty() {
+                                    state.custom_cash_selected_index = (state.custom_cash_selected_index + 1)
+                                        .min(state.custom_cash_items.len() - 1);
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                state.custom_cash_selected_index = state.custom_cash_selected_index.saturating_sub(1);
+                            }
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                state.custom_cash_modal_mode = CustomCashModalMode::Add;
+                                state.input_buffer.clear();
+                                state.input_error = None;
+                            }
+                            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Enter => {
+                                if !state.custom_cash_items.is_empty() {
+                                    let item = &state.custom_cash_items[state.custom_cash_selected_index];
+                                    // don't reveal the amount while privacy mode hides it
+                                    state.input_buffer = if state.privacy_mode.hides_amounts() {
+                                        String::new()
+                                    } else {
+                                        format!("{} {}", item.amount, item.currency)
+                                    };
+                                    state.input_error = None;
+                                    state.custom_cash_modal_mode = CustomCashModalMode::Edit;
+                                }
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete
+                                if !state.custom_cash_items.is_empty() =>
+                            {
+                                let idx = state.custom_cash_selected_index;
+                                let removed = state.remove_custom_cash_item(idx);
+                                state.custom_cash_selected_index =
+                                    idx.min(state.custom_cash_items.len().saturating_sub(1));
+                                if let Some(r) = removed {
+                                    state.set_notification(format!("Removed {}", r.name));
+                                }
+                                persist_custom_cash(&mut state);
+                            }
+                            _ => {}
+                        },
+                        mode @ (CustomCashModalMode::Add | CustomCashModalMode::Edit) => match key.code {
+                            KeyCode::Enter => {
+                                let buffer = state.input_buffer.trim().to_string();
+                                let outcome = if mode == CustomCashModalMode::Add {
+                                    crate::config::parse_custom_cash_entry(&buffer).and_then(|item| {
+                                        let name = item.name.clone();
+                                        state.add_custom_cash_item(item)?;
+                                        state.custom_cash_selected_index = state.custom_cash_items.len() - 1;
+                                        Ok(format!("Added {name}"))
+                                    })
+                                } else {
+                                    crate::config::parse_amount_currency(&buffer).map(|(amount, curr)| {
+                                        let idx = state.custom_cash_selected_index;
+                                        state.edit_custom_cash_item(idx, amount, &curr);
+                                        "Updated custom cash".to_string()
+                                    })
+                                };
+                                match outcome {
+                                    Ok(message) => {
+                                        state.custom_cash_modal_mode = CustomCashModalMode::List;
+                                        state.input_buffer.clear();
+                                        state.input_error = None;
+                                        state.set_notification(message);
+                                        persist_custom_cash(&mut state);
+                                    }
+                                    Err(err) => state.input_error = Some(err),
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.custom_cash_modal_mode = CustomCashModalMode::List;
+                                state.input_buffer.clear();
+                                state.input_error = None;
+                            }
+                            KeyCode::Backspace => {
+                                state.input_buffer.pop();
+                                state.input_error = None;
+                            }
+                            KeyCode::Char(c) => {
+                                state.input_buffer.push(c);
+                                state.input_error = None;
+                            }
+                            _ => {}
+                        },
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        state.scroll_down();
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            state.should_quit = true;
+                            break;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            state.scroll_down();
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            state.scroll_up();
+                        }
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            state.cycle_privacy_mode();
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            state.custom_cash_modal_open = true;
+                            state.custom_cash_modal_mode = CustomCashModalMode::List;
+                            state.custom_cash_selected_index = 0;
+                            state.input_buffer.clear();
+                            state.input_error = None;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        state.scroll_up();
-                    }
-                    KeyCode::Char('p') | KeyCode::Char('P') => {
-                        state.cycle_privacy_mode();
-                    }
-                    _ => {}
                 }
             }
     }
@@ -645,6 +772,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore terminal cleanly
     teardown_terminal()?;
     Ok(())
+}
+
+/// Writes the current custom cash list back to the loaded config; a failure replaces the pending notification.
+fn persist_custom_cash(state: &mut AppState) {
+    if let Err(e) = config::save_custom_cash_to_config(&state.config_path, &state.custom_cash_items) {
+        state.set_notification(format!("Config save failed: {e}"));
+    }
 }
 
 fn setup_panic_hook() {

@@ -25,20 +25,6 @@ pub struct OutdatedField {
 }
 
 impl OutdatedField {
-    #[allow(dead_code)]
-    pub fn age_display(&self) -> String {
-        let s = self.elapsed_secs;
-        if s < 60 {
-            format!("{}s", s)
-        } else if s < 3600 {
-            format!("{}m {:02}s", s / 60, s % 60)
-        } else if s < 86400 {
-            format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
-        } else {
-            format!("{}d {:02}h", s / 86400, (s % 86400) / 3600)
-        }
-    }
-
     pub fn time_display(&self) -> String {
         self.gathered_time.format("%d.%m.%Y %H:%M:%S").to_string()
     }
@@ -100,7 +86,7 @@ impl std::fmt::Display for AccountCategory {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FxRates {
     pub usd_to_chf: f64,
     pub eur_to_chf: f64,
@@ -175,6 +161,13 @@ impl PrivacyMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomCashModalMode {
+    List,
+    Add,
+    Edit,
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub tickers: Vec<TickerItem>,
@@ -186,6 +179,14 @@ pub struct AppState {
     pub scroll_offset: usize,
     pub should_quit: bool,
     pub privacy_mode: PrivacyMode,
+    pub custom_cash_items: Vec<crate::config::CustomCashItem>,
+    pub custom_cash_modal_open: bool,
+    pub custom_cash_modal_mode: CustomCashModalMode,
+    pub custom_cash_selected_index: usize,
+    pub input_buffer: String,
+    pub input_error: Option<String>,
+    pub notification: Option<(String, Instant)>,
+    pub config_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -209,7 +210,26 @@ impl AppState {
             scroll_offset: 0,
             should_quit: false,
             privacy_mode: PrivacyMode::Normal,
+            custom_cash_items: Vec::new(),
+            custom_cash_modal_open: false,
+            custom_cash_modal_mode: CustomCashModalMode::List,
+            custom_cash_selected_index: 0,
+            input_buffer: String::new(),
+            input_error: None,
+            notification: None,
+            config_path: std::path::PathBuf::from("config.json"),
         }
+    }
+
+    pub fn set_notification(&mut self, msg: String) {
+        self.notification = Some((msg, Instant::now()));
+    }
+
+    pub fn get_active_notification(&self) -> Option<&str> {
+        self.notification
+            .as_ref()
+            .filter(|(_, shown_at)| shown_at.elapsed().as_secs() < 6)
+            .map(|(msg, _)| msg.as_str())
     }
 
     pub fn total_balance_usd(&self) -> f64 {
@@ -317,6 +337,9 @@ impl AppState {
             } else if norm == "CHF" {
                 self.balances[i].value_native = amount;
                 self.balances[i].native_currency = "CHF".to_string();
+            } else if norm == "AUD" {
+                self.balances[i].value_native = amount;
+                self.balances[i].native_currency = "AUD".to_string();
             } else if self.balances[i].category == AccountCategory::Crypto
                 && let Some(price) = self.get_crypto_price(&symbol)
             {
@@ -331,9 +354,69 @@ impl AppState {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn mark_account_live(&mut self, account: &str) {
-        self.account_sync.insert(account.to_string(), SyncStatus::Live);
+    pub fn is_custom_cash_account(&self, account: &str) -> bool {
+        self.custom_cash_items.iter().any(|c| c.name.eq_ignore_ascii_case(account))
+    }
+
+    /// Rebuilds the manual Cash rows from custom_cash_items. Every Cash row that no automated provider
+    /// owns is manual, so cached rows for renamed or removed fields are purged too. Manual rows carry no
+    /// gathered timestamp: they are not collected data and must not drive the "most outdated" indicator.
+    pub fn apply_custom_cash_items(&mut self) {
+        let manual: Vec<String> = self
+            .balances
+            .iter()
+            .filter(|b| b.category == AccountCategory::Cash && !crate::config::is_reserved_automated_account(&b.account))
+            .map(|b| b.account.clone())
+            .collect();
+        self.balances
+            .retain(|b| b.category != AccountCategory::Cash || crate::config::is_reserved_automated_account(&b.account));
+        for name in &manual {
+            self.account_sync.remove(name);
+            self.account_last_gathered.remove(name);
+        }
+
+        let fx = self.fx_rates;
+        for item in &self.custom_cash_items {
+            let curr = item.currency.to_uppercase();
+            self.balances.push(BalanceItem {
+                account: item.name.clone(),
+                category: AccountCategory::Cash,
+                symbol: curr.clone(),
+                amount: item.amount,
+                native_currency: curr.clone(),
+                value_native: item.amount,
+                value_chf: fx.to_chf(&curr, item.amount),
+            });
+        }
+
+        self.save_balance_cache();
+    }
+
+    /// Names are unique (case-insensitive); an existing name is an error, not a silent overwrite.
+    pub fn add_custom_cash_item(&mut self, item: crate::config::CustomCashItem) -> Result<(), String> {
+        if self.is_custom_cash_account(&item.name) {
+            return Err(format!("'{}' already exists; select it and press e to edit", item.name));
+        }
+        self.custom_cash_items.push(item);
+        self.apply_custom_cash_items();
+        Ok(())
+    }
+
+    pub fn remove_custom_cash_item(&mut self, index: usize) -> Option<crate::config::CustomCashItem> {
+        if index >= self.custom_cash_items.len() {
+            return None;
+        }
+        let removed = self.custom_cash_items.remove(index);
+        self.apply_custom_cash_items();
+        Some(removed)
+    }
+
+    pub fn edit_custom_cash_item(&mut self, index: usize, amount: f64, currency: &str) {
+        if index < self.custom_cash_items.len() {
+            self.custom_cash_items[index].amount = amount;
+            self.custom_cash_items[index].currency = currency.to_uppercase();
+            self.apply_custom_cash_items();
+        }
     }
 
     pub fn mark_account_stale(&mut self, account: &str) {
@@ -458,8 +541,10 @@ impl AppState {
         let mut accounts_seen = std::collections::HashSet::new();
 
         for b in &self.balances {
-            if accounts_seen.insert(b.account.clone()) {
-                let time = self.account_last_gathered.get(&b.account).copied().unwrap_or(now);
+            // rows that were never gathered (manual cash fields) are not outdated data
+            if accounts_seen.insert(b.account.clone())
+                && let Some(&time) = self.account_last_gathered.get(&b.account)
+            {
                 let elapsed = now.duration_since(time).unwrap_or_default().as_secs();
                 let is_sess = Self::is_session_dependent(&b.account);
                 let is_stale = self.is_account_stale(&b.account);
@@ -743,7 +828,7 @@ mod tests {
 
         state.mark_account_stale("UH");
         assert!(state.is_account_stale("UH"));
-        state.mark_account_live("UH");
+        state.account_sync.insert("UH".to_string(), SyncStatus::Live);
         assert!(!state.is_account_stale("UH"));
     }
 
@@ -758,7 +843,6 @@ mod tests {
             elapsed_secs: 42,
             gathered_time: now,
         };
-        assert_eq!(field_sec.age_display(), "42s");
         assert_eq!(field_sec.time_display(), now.format("%d.%m.%Y %H:%M:%S").to_string());
         assert_eq!(field_sec.status_color(), ratatui::style::Color::Yellow);
 
@@ -770,7 +854,6 @@ mod tests {
             elapsed_secs: 863, // 14m 23s
             gathered_time: now,
         };
-        assert_eq!(field_min.age_display(), "14m 23s");
         assert_eq!(field_min.status_color(), ratatui::style::Color::LightCyan);
 
         let field_hour = OutdatedField {
@@ -781,7 +864,6 @@ mod tests {
             elapsed_secs: 7320, // 2h 02m
             gathered_time: now,
         };
-        assert_eq!(field_hour.age_display(), "2h 02m");
         assert_eq!(field_hour.status_color(), ratatui::style::Color::LightRed);
 
         let field_day = OutdatedField {
@@ -792,7 +874,6 @@ mod tests {
             elapsed_secs: 100000,
             gathered_time: now,
         };
-        assert_eq!(field_day.age_display(), "1d 03h");
         assert_eq!(field_day.time_display(), now.format("%d.%m.%Y %H:%M:%S").to_string());
     }
 
@@ -866,6 +947,82 @@ mod tests {
         assert_eq!(state.privacy_mode, PrivacyMode::Normal);
         assert!(!state.privacy_mode.hides_amounts());
         assert!(!state.privacy_mode.hides_quantities());
+    }
+
+    #[test]
+    fn test_custom_cash_crud() {
+        let mut state = AppState::new(vec![], vec![]);
+        state.fx_rates.gbp_to_chf = 1.09;
+        state.fx_rates.eur_to_chf = 0.94;
+
+        // An automated provider's Cash row must survive every manual operation untouched
+        let st_row = BalanceItem {
+            account: "ST".to_string(),
+            category: AccountCategory::Cash,
+            symbol: "GBP".to_string(),
+            amount: 10.0,
+            native_currency: "GBP".to_string(),
+            value_native: 10.0,
+            value_chf: 10.9,
+        };
+        state.update_account_balances("ST", vec![st_row.clone()]);
+        // A stale cached manual row not in the list gets purged on apply
+        state.balances.push(BalanceItem { account: "Old Wallet".to_string(), ..st_row.clone() });
+        state.account_last_gathered.insert("Old Wallet".to_string(), std::time::SystemTime::now());
+
+        // Add Chase
+        state
+            .add_custom_cash_item(crate::config::CustomCashItem {
+                name: "Chase".to_string(),
+                amount: 1234.50,
+                currency: "GBP".to_string(),
+            })
+            .unwrap();
+
+        // Add Physical Cash
+        state
+            .add_custom_cash_item(crate::config::CustomCashItem {
+                name: "Safe Deposit".to_string(),
+                amount: 500.0,
+                currency: "CHF".to_string(),
+            })
+            .unwrap();
+
+        // Names are unique regardless of case
+        let dup = state.add_custom_cash_item(crate::config::CustomCashItem {
+            name: "chase".to_string(),
+            amount: 1.0,
+            currency: "GBP".to_string(),
+        });
+        assert!(dup.unwrap_err().contains("already exists"));
+
+        assert_eq!(state.custom_cash_items.len(), 2);
+        assert_eq!(state.balances.len(), 3, "ST row + 2 manual rows; Old Wallet purged");
+        assert!(!state.balances.iter().any(|b| b.account == "Old Wallet"));
+        assert!(!state.account_last_gathered.contains_key("Old Wallet"));
+        assert!(state.is_custom_cash_account("Chase"));
+        assert!(state.is_custom_cash_account("Safe Deposit"));
+        assert!(!state.is_custom_cash_account("UBS"));
+        // manual rows are not "gathered" data
+        assert!(!state.account_last_gathered.contains_key("Chase"));
+        assert!(state.account_last_gathered.contains_key("ST"));
+        assert_eq!(state.most_outdated_account().unwrap().name, "ST");
+
+        // Edit Safe Deposit
+        state.edit_custom_cash_item(1, 750.0, "EUR");
+        assert_eq!(state.custom_cash_items[1].amount, 750.0);
+        assert_eq!(state.custom_cash_items[1].currency, "EUR");
+        let safe_bal = state.balances.iter().find(|b| b.account == "Safe Deposit").unwrap();
+        assert_eq!(safe_bal.amount, 750.0);
+        assert_eq!(safe_bal.symbol, "EUR");
+
+        // Remove Chase
+        let removed = state.remove_custom_cash_item(0).unwrap();
+        assert_eq!(removed.name, "Chase");
+        assert_eq!(state.custom_cash_items.len(), 1);
+        assert_eq!(state.balances.len(), 2);
+        assert!(!state.balances.iter().any(|b| b.account == "Chase"));
+        assert_eq!(state.balances.iter().find(|b| b.account == "ST"), Some(&st_row));
     }
 }
 
