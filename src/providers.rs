@@ -130,36 +130,42 @@ impl Providers {
     }
 
 
-    /// Fetch Monero balance: MoneroOcean pool pending due + local RPC daemon
+    /// Total Monero: rewards the pool still owes plus the local wallet balance. `None` when either
+    /// source cannot be read, so the caller keeps the last known total instead of publishing a
+    /// partial one. The wallet RPC in particular stays silent for as long as the wallet is syncing,
+    /// and reporting the pool rewards alone during that window understates the holding to ~zero.
     pub async fn fetch_monero_balance(&self, address: &str) -> Option<f64> {
-        let mut total = 0.0;
+        let pool = self.fetch_moneroocean_due(address).await?;
+        let wallet = self.fetch_monero_wallet_balance().await?;
+        Some(pool + wallet)
+    }
 
-        // 1. MoneroOcean pending rewards
-        let mo_url = format!("https://api.moneroocean.stream/miner/{address}/stats");
-        if let Ok(resp) = self.client.get(&mo_url).send().await
-            && let Ok(json) = resp.json::<Value>().await
-                && let Some(amt_due) = json.get("amtDue").and_then(|a| a.as_f64()) {
-                    total += amt_due / 1_000_000_000_000.0;
-                }
+    /// Mining rewards the MoneroOcean pool has not paid out yet.
+    async fn fetch_moneroocean_due(&self, address: &str) -> Option<f64> {
+        let url = format!("https://api.moneroocean.stream/miner/{address}/stats");
+        let json: Value = self.client.get(&url).send().await.ok()?.json().await.ok()?;
+        // an address with nothing pending reports no amtDue: a real zero, not a failed read
+        Some(json.get("amtDue").and_then(|a| a.as_f64()).unwrap_or(0.0) / 1_000_000_000_000.0)
+    }
 
-        // 2. Local Monero wallet RPC (port 28088)
-        let rpc_body = serde_json::json!({
+    /// Balance from the local wallet RPC, which only answers once the wallet has finished loading.
+    async fn fetch_monero_wallet_balance(&self) -> Option<f64> {
+        let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "0",
             "method": "get_balance"
         });
-        if let Ok(resp) = self
+        let json: Value = self
             .client
             .post("http://127.0.0.1:28088/json_rpc")
-            .json(&rpc_body)
+            .json(&body)
             .send()
             .await
-            && let Ok(json) = resp.json::<Value>().await
-                && let Some(balance) = json["result"]["balance"].as_f64() {
-                    total += balance / 1_000_000_000_000.0;
-                }
-
-        Some(total)
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(json["result"]["balance"].as_f64()? / 1_000_000_000_000.0)
     }
 
     /// Fetch Uphold cards with positive balance (with automatic CDP token extraction failover)

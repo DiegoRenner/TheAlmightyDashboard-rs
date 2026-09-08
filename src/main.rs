@@ -214,45 +214,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             loop {
                 // Check Monero balances (MW)
-                let mut mw_items = Vec::new();
+                let mut mw_amounts = Vec::new();
+                let mut mw_complete = true;
                 for addr in &monero_addrs {
-                    if let Some(amt) = prov.fetch_monero_balance(addr).await
-                        && amt > 0.0 {
-                            let xmr_price = {
-                                let cached = {
-                                    let state = app.read().await;
-                                    state.get_crypto_price("XMR")
-                                };
-                                if let Some(p) = cached {
-                                    p
-                                } else if let Some(p) = prov.fetch_asset_price_usd("XMR").await {
-                                    let mut state = app.write().await;
-                                    state.set_crypto_price("XMR", p);
-                                    p
-                                } else {
-                                    0.0
-                                }
-                            };
-                            let fx = {
-                                let state = app.read().await;
-                                state.fx_rates
-                            };
-                            let val_usd = amt * xmr_price;
-                            let val_chf = fx.to_chf("USD", val_usd);
-                            mw_items.push(BalanceItem {
-                                account: "MW".to_string(),
-                                category: AccountCategory::Crypto,
-                                symbol: "XMR".to_string(),
-                                amount: amt,
-                                native_currency: "USD".to_string(),
-                                value_native: val_usd,
-                                value_chf: val_chf,
-                            });
-                        }
+                    match prov.fetch_monero_balance(addr).await {
+                        Some(amt) => mw_amounts.push(amt),
+                        None => mw_complete = false,
+                    }
                 }
-                if !mw_items.is_empty() {
+                if !mw_complete {
+                    // a source we could not read understates the total, so leave the cached value
+                    // in place and flag it rather than overwriting it with a partial balance
                     let mut state = app.write().await;
-                    state.update_account_balances("MW", mw_items);
+                    state.mark_account_stale("MW");
+                } else {
+                    let mut mw_items = Vec::new();
+                    for amt in mw_amounts.into_iter().filter(|a| *a > 0.0) {
+                        let xmr_price = {
+                            let cached = {
+                                let state = app.read().await;
+                                state.get_crypto_price("XMR")
+                            };
+                            if let Some(p) = cached {
+                                p
+                            } else if let Some(p) = prov.fetch_asset_price_usd("XMR").await {
+                                let mut state = app.write().await;
+                                state.set_crypto_price("XMR", p);
+                                p
+                            } else {
+                                0.0
+                            }
+                        };
+                        let fx = {
+                            let state = app.read().await;
+                            state.fx_rates
+                        };
+                        let val_usd = amt * xmr_price;
+                        let val_chf = fx.to_chf("USD", val_usd);
+                        mw_items.push(BalanceItem {
+                            account: "MW".to_string(),
+                            category: AccountCategory::Crypto,
+                            symbol: "XMR".to_string(),
+                            amount: amt,
+                            native_currency: "USD".to_string(),
+                            value_native: val_usd,
+                            value_chf: val_chf,
+                        });
+                    }
+                    if !mw_items.is_empty() {
+                        let mut state = app.write().await;
+                        state.update_account_balances("MW", mw_items);
+                    }
                 }
 
                 // Check Chia balance (CW)
