@@ -2209,7 +2209,7 @@ mod tests {
         assert_eq!(items[0].symbol, "GBP");
         assert_eq!(items[0].amount, 33.40);
         assert_eq!(items[0].value_native, 33.40);
-        assert_eq!(items[0].value_chf, 36.74); // 33.40 * 1.10 = 36.74 -> 36.74
+        assert_eq!(items[0].value_chf, 36.74); // 33.40 * 1.10 = 36.74
 
         assert_eq!(items[1].account, "REV");
         assert_eq!(items[1].symbol, "CHF");
